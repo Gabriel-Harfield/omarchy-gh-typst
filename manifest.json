@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gabrielharfield.ghtypst",
+  "name": "GH Typst",
+  "version": "0.1.0",
+  "author": "gabrielharfield",
+  "license": "MIT",
+  "description": "Personal Typst editor: syntax-aware highlighting, live compiled preview, real typst-compiler error reporting, and a Claude-powered code review tab that proposes fixes with a change log. Not for the marketplace — personal tool. No bar icon — summon with: omarchy-shell shell summon io.github.gabrielharfield.ghtypst",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}
