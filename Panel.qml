@@ -44,6 +44,52 @@ Item {
     root.closingFromHost = false
   }
 
+  // True if the active document OR any other open tab has real unsaved
+  // edits — checked before forgetting everything on close (see
+  // _forgetEverythingOnClose() below). root.tabs only holds each
+  // INACTIVE tab's own last-snapshotted dirty flag; the active one's
+  // live state is root.dirty itself, not yet written back into tabs[].
+  function _anyUnsavedWork() {
+    if (root.dirty) return true
+    for (var i = 0; i < root.tabs.length; i++) {
+      if (root.tabs[i].id !== root.activeDocId && root.tabs[i].dirty) return true
+    }
+    return false
+  }
+
+  // Gabriel's explicit ask, 2026-08-30, after a real cross-machine
+  // data-loss incident (see the "no session persistence, by design"
+  // comment further down for the full story): closing this app must
+  // forget whatever was open — not just across a shell restart, but on
+  // every ordinary close/reopen too. `keepLoaded: true` means the
+  // component would otherwise survive a plain close completely
+  // untouched, which is exactly what surprised him: closing the window
+  // alone wasn't enough, only a full shell restart forgot anything.
+  //
+  // Gated on _anyUnsavedWork() rather than called unconditionally:
+  // Hyprland's Super+W (Gabriel's own usual way of closing this plugin,
+  // see requestClose()'s own comment) kills the Wayland toplevel directly
+  // and never reaches requestClose()'s unsaved-changes confirm dialog at
+  // all — so if something is genuinely unsaved when the window closes
+  // this way, forgetting it unconditionally would silently destroy real
+  // work with zero warning, trading one data-loss bug for another. When
+  // there IS unsaved work, this intentionally does nothing — the
+  // existing `keepLoaded` safety net (the buffer survives untouched
+  // until the user reopens the window) stays exactly as it was. Only a
+  // genuinely clean close (nothing at risk) actually forgets — which is
+  // the ordinary case, and the one Gabriel actually complained about: an
+  // already-saved, no-longer-relevant document quietly hanging around in
+  // memory.
+  function _forgetEverythingOnClose() {
+    if (root._anyUnsavedWork()) return
+    root.tabs = [{ id: 1, path: "", text: "", dirty: false, notesText: "", rightPaneView: "apercu", loaded: false }]
+    root._nextDocId = 2
+    root.activeDocId = 1
+    root.newDocument()
+    root.notesText = ""
+    editorTabItem.clearUndoHistory()
+  }
+
   // The one gate every "the user wants to close this" path should go
   // through: if there's something unsaved, ask first instead of hiding
   // straight away. Known limitation, told to Gabriel directly rather than
@@ -1651,6 +1697,12 @@ Item {
     onVisibleChanged: {
       if (!visible && !root.closingFromHost && root.shell && typeof root.shell.hide === "function")
         root.shell.hide("io.github.gabrielharfield.ghtypst")
+      // Fires for every path that makes the window invisible — including
+      // Super+W, which bypasses requestClose() entirely — so this is the
+      // one place that reliably runs on every close, not just the IPC
+      // path. See _forgetEverythingOnClose()'s own comment for why it's
+      // still safe even here.
+      if (!visible) root._forgetEverythingOnClose()
     }
 
     // Belt-and-suspenders opaque backdrop: `color: root.bg` above should be
@@ -2232,6 +2284,13 @@ Item {
         onCanceled: root.showCloseConfirm = false
         onConfirmed: {
           root.showCloseConfirm = false
+          // Explicitly resolved, not just ignored — this is what lets
+          // _forgetEverythingOnClose() (triggered right after, via
+          // window.visible going false) know the active document's
+          // unsaved state was a real, informed choice to discard, not
+          // something to silently protect. Any OTHER still-dirty tab is
+          // untouched and still blocks the reset on its own.
+          root.dirty = false
           root.close()
         }
       }
