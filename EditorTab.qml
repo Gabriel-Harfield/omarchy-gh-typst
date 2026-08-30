@@ -3,6 +3,7 @@ import QtQuick.Controls
 import qs.Commons
 import qs.Ui
 import "lib/Highlighter.js" as Highlighter
+import "lib/Calendar.js" as Calendar
 
 // Isolated component: the code editor (single RichText TextEdit, colored
 // in place on a debounce), the compiler-error list, and the live preview
@@ -62,11 +63,26 @@ Item {
   required property string suggestWord
   required property var suggestions
   required property bool suggestBusy
-  // Aperçu/Notes right-pane switcher (Gabriel's ask, 2026-08-29) —
-  // "apercu" | "notes". Independent of previewEnabled, which only
-  // controls whether Typst compilation runs at all.
+  // Aperçu/Notes/Journal right-pane switcher (Gabriel's ask, 2026-08-29,
+  // "journal" added 2026-08-30) — "apercu" | "notes" | "journal".
+  // Independent of previewEnabled, which only controls whether Typst
+  // compilation runs at all.
   required property string rightPaneView
   required property string notesText
+  // Journal (Gabriel's ask, 2026-08-30) — a small month calendar above a
+  // plain-text view of "<journalDir>/YYYY_MM_DD.md" (Logseq's own journal
+  // filename convention). Deliberately GLOBAL state, not per-document like
+  // notesText above: the same calendar/entry shows regardless of which
+  // .typ tab is active. journalDir === "" means unconfigured — shows a
+  // "set this in Paramètres" prompt instead of a broken calendar.
+  required property string journalDir
+  required property int journalViewYear
+  required property int journalViewMonth
+  required property int journalSelectedYear
+  required property int journalSelectedMonth
+  required property int journalSelectedDay
+  required property string journalText
+  required property var journalEntryDays
   // Left panel (file tree / heading outline) — "" | "files" | "headings".
   // Lives in Panel.qml (it owns the actual panel layout, a sibling of
   // this whole component, not a child of it) but the toggle buttons
@@ -83,6 +99,10 @@ Item {
   signal lineNumbersToggleRequested()
   signal narrowMarginsToggleRequested()
   signal rightPaneHiddenToggleRequested()
+  signal journalPrevMonthRequested()
+  signal journalNextMonthRequested()
+  signal journalDaySelected(int day)
+  signal journalTextEdited(string newText)
   signal spellcheckRequested(string text)
   signal suggestRequested(string word)
   signal applySuggestionRequested(int start, int end, string replacement)
@@ -100,6 +120,35 @@ Item {
     notesField.text = root.notesText
     root._notesProgrammatic = false
   }
+
+  // Same imperative-resync guard, same reason, for the Journal entry text
+  // — journalText changes every time a different day is selected.
+  property bool _journalProgrammatic: false
+  onJournalTextChanged: {
+    if (!journalField || journalField.text === root.journalText) return
+    root._journalProgrammatic = true
+    journalField.text = root.journalText
+    root._journalProgrammatic = false
+  }
+
+  // Pure month-grid layout, computed locally (Calendar.js has no QML/file
+  // dependencies of its own, same "isolated component" spirit as this
+  // file's own use of Highlighter.js). journalWeeks is an array of weeks,
+  // each exactly 7 cells (null padding or a 1-based day number);
+  // journalCells flattens that into one list for a single Grid+Repeater
+  // rather than nesting a nested Repeater-inside-Row-inside-Repeater.
+  readonly property var journalWeeks: Calendar.buildMonthGrid(root.journalViewYear, root.journalViewMonth)
+  readonly property var journalCells: {
+    var out = []
+    for (var w = 0; w < journalWeeks.length; w++) out = out.concat(journalWeeks[w])
+    return out
+  }
+  readonly property string journalMonthLabel: Calendar.monthLabel(root.journalViewYear, root.journalViewMonth)
+  // Evaluated once at load, not live-reactive — an app running across
+  // midnight showing yesterday's date as "today" for the rest of the
+  // session is a harmless, extremely unlikely edge case, not worth a
+  // Timer to refresh it.
+  readonly property var _journalToday: new Date()
 
   // --- rechercher / remplacer (Ctrl+F) ------------------------------------
   //
@@ -1150,6 +1199,13 @@ Item {
             accent: root.accentColor
             onClicked: root.rightPaneViewRequested("notes")
           }
+          Button {
+            text: "Journal"
+            selected: root.rightPaneView === "journal"
+            foreground: root.dim
+            accent: root.accentColor
+            onClicked: root.rightPaneViewRequested("journal")
+          }
           Text {
             visible: root.compiling
             text: "· compilation…"
@@ -1283,6 +1339,172 @@ Item {
             background: null
             onTextChanged: if (!root._notesProgrammatic) root.notesEdited(text)
             Component.onCompleted: text = root.notesText
+          }
+        }
+      }
+
+      // Journal (Gabriel's ask, 2026-08-30) — a month calendar above a
+      // plain-text view of the selected day's entry. See root's own
+      // comments on journalDir/journalWeeks/journalCells for the data
+      // model; this block is purely presentational.
+      Rectangle {
+        width: parent.width
+        height: parent.height - Style.space(30)
+        color: Qt.darker(root.background, 1.05)
+        border.color: root.faint
+        border.width: 1
+        radius: Style.cornerRadius
+        clip: true
+        visible: root.rightPaneView === "journal"
+
+        Text {
+          visible: root.journalDir === ""
+          anchors.fill: parent
+          anchors.margins: Style.space(12)
+          wrapMode: Text.Wrap
+          text: "Configurez le dossier du journal dans l'onglet Paramètres pour activer cette vue."
+          color: root.faint
+          font.family: root.uiFont
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Column {
+          id: journalRoot
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          spacing: Style.space(8)
+          visible: root.journalDir !== ""
+
+          Column {
+            id: journalCalendar
+            width: parent.width
+            spacing: Style.space(6)
+
+            Row {
+              width: parent.width
+              height: journalMonthLabelText.implicitHeight
+
+              Button {
+                iconText: ""
+                foreground: root.foreground
+                accent: root.accentColor
+                onClicked: root.journalPrevMonthRequested()
+              }
+              Text {
+                id: journalMonthLabelText
+                width: parent.width - Style.space(80)
+                horizontalAlignment: Text.AlignHCenter
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.journalMonthLabel
+                color: root.foreground
+                font.family: root.uiFont
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Button {
+                iconText: ""
+                foreground: root.foreground
+                accent: root.accentColor
+                onClicked: root.journalNextMonthRequested()
+              }
+            }
+
+            Row {
+              width: parent.width
+              Repeater {
+                model: ["L", "M", "M", "J", "V", "S", "D"]
+                Text {
+                  required property string modelData
+                  width: (parent.width) / 7
+                  horizontalAlignment: Text.AlignHCenter
+                  text: modelData
+                  color: root.faint
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+
+            Grid {
+              width: parent.width
+              columns: 7
+              columnSpacing: Style.space(2)
+              rowSpacing: Style.space(2)
+
+              Repeater {
+                model: root.journalCells
+
+                Rectangle {
+                  id: journalDayCell
+                  required property var modelData
+                  readonly property bool isDay: modelData !== null
+                  readonly property bool isSelected: isDay && modelData === root.journalSelectedDay
+                    && root.journalViewYear === root.journalSelectedYear
+                    && root.journalViewMonth === root.journalSelectedMonth
+                  readonly property bool isToday: isDay && modelData === root._journalToday.getDate()
+                    && root.journalViewYear === root._journalToday.getFullYear()
+                    && root.journalViewMonth === (root._journalToday.getMonth() + 1)
+                  readonly property bool hasEntry: isDay && root.journalEntryDays[modelData] === true
+
+                  width: (parent.width - Style.space(2) * 6) / 7
+                  height: width
+                  radius: Style.cornerRadius
+                  color: isSelected ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.35) : "transparent"
+                  border.color: isToday ? root.accentColor : "transparent"
+                  border.width: 1
+
+                  Text {
+                    visible: journalDayCell.isDay
+                    anchors.centerIn: parent
+                    text: journalDayCell.modelData || ""
+                    color: root.foreground
+                    font.family: root.uiFont
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Rectangle {
+                    visible: journalDayCell.hasEntry
+                    width: Style.space(4)
+                    height: Style.space(4)
+                    radius: width / 2
+                    color: root.accentColor
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: Style.space(2)
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    visible: journalDayCell.isDay
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.journalDaySelected(journalDayCell.modelData)
+                  }
+                }
+              }
+            }
+          }
+
+          ScrollView {
+            id: journalScroll
+            width: parent.width
+            height: journalRoot.height - journalCalendar.height - journalRoot.spacing
+            clip: true
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            // Same imperative text seed/resync as notesField above —
+            // journalText changes every time a different day is clicked.
+            TextArea {
+              id: journalField
+              width: journalScroll.availableWidth
+              placeholderText: "Entrée de journal pour le jour sélectionné…"
+              wrapMode: TextEdit.Wrap
+              color: root.notesColor
+              font.family: root.monoFont
+              font.pixelSize: root.editorFontSize
+              background: null
+              onTextChanged: if (!root._journalProgrammatic) root.journalTextEdited(text)
+              Component.onCompleted: text = root.journalText
+            }
           }
         }
       }

@@ -8,6 +8,7 @@ import "lib/Store.js" as Store
 import "lib/CodeReview.js" as CodeReview
 import "lib/Spellcheck.js" as Spellcheck
 import "lib/Outline.js" as Outline
+import "lib/Calendar.js" as Calendar
 
 // GH Typst: a personal Typst editor. Highlighting + live preview + real
 // compiler diagnostics live in EditorTab.qml; the Claude-powered review
@@ -200,6 +201,118 @@ Item {
   function onNotesEdited(newText) {
     root.notesText = newText
     if (root.docPath) notesSaveDebounce.restart()
+  }
+
+  // --- journal (Aperçu/Notes/Journal right-pane view) ---------------------
+  //
+  // Gabriel's ask, 2026-08-30: a small month calendar above a plain-text
+  // view of that day's entry, reading/writing "<journalDir>/YYYY_MM_DD.md"
+  // — Logseq's own journal filename convention exactly, so entries land in
+  // the same folder Logseq already watches and either app can create/edit
+  // a day the other one also understands. Deliberately GLOBAL, not
+  // per-document like notesText above: the calendar shows the same journal
+  // regardless of which .typ tab is active.
+  //
+  // journalDir is a plain Paramètres setting (see settings block below),
+  // "" until configured — no sensible default exists for an arbitrary
+  // install, so the Journal view prompts for one rather than guessing.
+  property int journalViewYear: new Date().getFullYear()
+  property int journalViewMonth: new Date().getMonth() + 1 // 1-12
+  property int journalSelectedYear: new Date().getFullYear()
+  property int journalSelectedMonth: new Date().getMonth() + 1
+  property int journalSelectedDay: new Date().getDate()
+  property string journalText: ""
+  // {dayNumber: true}, scoped to journalViewYear/Month — rebuilt from a
+  // directory listing whenever the visible month or the folder changes,
+  // not a per-day existence check (31 stats vs. one `ls`).
+  property var journalEntryDays: ({})
+
+  readonly property string journalFilePath: {
+    if (!root.journalDir || !root.journalSelectedDay) return ""
+    var base = root.journalDir.replace(/\/+$/, "")
+    return base + "/" + Calendar.dateKey(root.journalSelectedYear, root.journalSelectedMonth, root.journalSelectedDay) + ".md"
+  }
+
+  function journalPrevMonth() {
+    var r = Calendar.addMonths(root.journalViewYear, root.journalViewMonth, -1)
+    root.journalViewYear = r.year
+    root.journalViewMonth = r.month
+  }
+
+  function journalNextMonth() {
+    var r = Calendar.addMonths(root.journalViewYear, root.journalViewMonth, 1)
+    root.journalViewYear = r.year
+    root.journalViewMonth = r.month
+  }
+
+  function journalSelectDay(day) {
+    root.journalSelectedYear = root.journalViewYear
+    root.journalSelectedMonth = root.journalViewMonth
+    root.journalSelectedDay = day
+  }
+
+  // Idempotent — cheap enough to call on every journalDir change without
+  // worrying about it having already been created.
+  function _ensureJournalDir() {
+    if (!root.journalDir) return
+    journalMkdirProc.command = ["mkdir", "-p", root.journalDir]
+    journalMkdirProc.running = false
+    journalMkdirProc.running = true
+  }
+
+  Process { id: journalMkdirProc }
+
+  function _refreshJournalEntryDays() {
+    if (!root.journalDir) { root.journalEntryDays = {}; return }
+    journalListProc.command = ["ls", "-1", root.journalDir]
+    journalListProc.running = false
+    journalListProc.running = true
+  }
+
+  Process {
+    id: journalListProc
+    stdout: StdioCollector { id: journalListStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.journalEntryDays = {}; return }
+      var lines = (journalListStdout.text || "").split("\n").filter(function(l) { return l.length > 0 })
+      root.journalEntryDays = Calendar.daysWithEntries(lines, root.journalViewYear, root.journalViewMonth)
+    }
+  }
+
+  onJournalDirChanged: { root._ensureJournalDir(); root._refreshJournalEntryDays() }
+  onJournalViewYearChanged: root._refreshJournalEntryDays()
+  onJournalViewMonthChanged: root._refreshJournalEntryDays()
+
+  FileView {
+    id: journalFile
+    path: root.journalFilePath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.journalText = journalFile.text()
+    onLoadFailed: root.journalText = "" // no entry yet for this day — not an error
+  }
+
+  Timer {
+    id: journalSaveDebounce
+    interval: 500
+    repeat: false
+    onTriggered: {
+      if (root.journalFilePath) {
+        journalFile.setText(root.journalText)
+        root._refreshJournalEntryDays()
+      }
+    }
+  }
+
+  // Deliberately does NOT create a file just from clicking/browsing to an
+  // empty day (journalSelectDay above never touches the filesystem) — a
+  // file only appears once there's actual text, same as notesFile above.
+  // Otherwise every idle click while flipping through months would litter
+  // Gabriel's real, Logseq-synced folder with empty entries.
+  function onJournalTextEdited(newText) {
+    root.journalText = newText
+    if (root.journalFilePath) journalSaveDebounce.restart()
   }
 
   // --- open-documents tabs (multiple documents at once) -------------------
@@ -1338,6 +1451,7 @@ Item {
   property bool lineNumbersEnabled: true
   property bool narrowMarginsEnabled: false
   property bool rightPaneHidden: false
+  property string journalDir: ""
   property string claudeModel: "" // "" | "sonnet" | "opus" | "haiku" | "fable" — "" = claude -p's own default
   property string claudeEffort: "" // "" | "low" | "medium" | "high" | "xhigh" | "max"
 
@@ -1360,6 +1474,7 @@ Item {
     root.lineNumbersEnabled = parsed.lineNumbersEnabled
     root.narrowMarginsEnabled = parsed.narrowMarginsEnabled
     root.rightPaneHidden = parsed.rightPaneHidden
+    root.journalDir = parsed.journalDir
     root.claudeModel = parsed.claudeModel
     root.claudeEffort = parsed.claudeEffort
     root.settingsLoaded = true
@@ -1377,6 +1492,7 @@ Item {
       lineNumbersEnabled: root.lineNumbersEnabled,
       narrowMarginsEnabled: root.narrowMarginsEnabled,
       rightPaneHidden: root.rightPaneHidden,
+      journalDir: root.journalDir,
       claudeModel: root.claudeModel,
       claudeEffort: root.claudeEffort
     }))
@@ -1422,6 +1538,11 @@ Item {
 
   function setRightPaneHidden(hidden) {
     root.rightPaneHidden = hidden
+    root.scheduleSettingsSave()
+  }
+
+  function setJournalDir(dir) {
+    root.journalDir = dir
     root.scheduleSettingsSave()
   }
 
@@ -1943,6 +2064,14 @@ Item {
               notesText: root.notesText
               notesAvailable: root.docPath !== ""
               leftPanelMode: root.leftPanelMode
+              journalDir: root.journalDir
+              journalViewYear: root.journalViewYear
+              journalViewMonth: root.journalViewMonth
+              journalSelectedYear: root.journalSelectedYear
+              journalSelectedMonth: root.journalSelectedMonth
+              journalSelectedDay: root.journalSelectedDay
+              journalText: root.journalText
+              journalEntryDays: root.journalEntryDays
               onTextEdited: function(newText) { root.onTextEdited(newText) }
               onZoomInRequested: root.setEditorZoom(root.editorZoom + 0.1)
               onZoomOutRequested: root.setEditorZoom(root.editorZoom - 0.1)
@@ -1956,6 +2085,10 @@ Item {
               onRightPaneViewRequested: function(view) { root.rightPaneView = view }
               onNotesEdited: function(newText) { root.onNotesEdited(newText) }
               onLeftPanelModeRequested: function(mode) { root.leftPanelMode = (root.leftPanelMode === mode) ? "" : mode }
+              onJournalPrevMonthRequested: root.journalPrevMonth()
+              onJournalNextMonthRequested: root.journalNextMonth()
+              onJournalDaySelected: function(day) { root.journalSelectDay(day) }
+              onJournalTextEdited: function(newText) { root.onJournalTextEdited(newText) }
             }
           }
 
@@ -2007,11 +2140,13 @@ Item {
             faint: root.faint
             accentColor: root.accentColor
             uiFont: root.uiFont
+            journalDir: root.journalDir
             onAutosaveEnabledSet: function(enabled) { root.setAutosaveEnabled(enabled) }
             onAutosaveMinutesSet: function(minutes) { root.setAutosaveMinutes(minutes) }
             onTypstUniverseOpenRequested: root.openWebapp(root.typstUniverseUrl)
             onTemplateLinkOpenRequested: function(url) { root.openWebapp(url) }
             onTemplateInsertRequested: function(command) { root.insertTemplate(command) }
+            onJournalDirSet: function(dir) { root.setJournalDir(dir) }
           }
         }
 

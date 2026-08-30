@@ -17,9 +17,23 @@ Item {
   required property color faint
   required property color accentColor
   required property string uiFont
+  required property string journalDir
 
   signal autosaveEnabledSet(bool enabled)
   signal autosaveMinutesSet(int minutes)
+  signal journalDirSet(string dir)
+
+  // journalDirField.text can't just be `text: root.journalDir` — the same
+  // established trap as pathBarField/notesField elsewhere in this
+  // codebase: a TextField's declarative binding is destroyed the instant
+  // the user types into it. Seeded once at creation, then imperatively
+  // re-synced only when journalDir actually changes from outside (the
+  // settings.json load completing shortly after this component exists,
+  // in practice) — never fights the user's own typing.
+  onJournalDirChanged: {
+    if (!journalDirField || journalDirField.text === root.journalDir) return
+    journalDirField.text = root.journalDir
+  }
 
   // --- Typst Universe template picker -------------------------------------
   //
@@ -211,6 +225,49 @@ Item {
             onClicked: root.templateInsertRequested(templateCard.modelData.insertCommand)
           }
         }
+      }
+    }
+
+    PanelSeparator { foreground: root.foreground; width: parent.width }
+
+    Text {
+      text: "Journal"
+      color: root.foreground
+      font.family: root.uiFont
+      font.pixelSize: Style.font.heading
+      font.bold: true
+    }
+
+    Text {
+      width: Math.min(parent.width, Style.space(520))
+      textFormat: Text.PlainText
+      text: "Dossier contenant vos entrées de journal, un fichier YYYY_MM_DD.md par jour (convention Logseq — le même fichier reste lisible et modifiable par les deux applications). Laissez vide pour désactiver l'onglet Journal."
+      color: root.dim
+      font.family: root.uiFont
+      font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.Wrap
+    }
+
+    Row {
+      spacing: Style.space(8)
+
+      TextField {
+        id: journalDirField
+        anchors.verticalCenter: parent.verticalCenter
+        width: Math.min(Style.space(460), settingsScroll.availableWidth - Style.space(180))
+        placeholderText: "/chemin/vers/le/dossier/journals"
+        Component.onCompleted: text = root.journalDir
+        onAccepted: root.journalDirSet(text.trim())
+      }
+
+      Button {
+        anchors.verticalCenter: parent.verticalCenter
+        iconText: ""
+        text: "Utiliser ce dossier"
+        bordered: true
+        foreground: root.foreground
+        accent: root.accentColor
+        onClicked: root.journalDirSet(journalDirField.text.trim())
       }
     }
   }
