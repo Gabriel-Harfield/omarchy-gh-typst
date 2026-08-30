@@ -44,44 +44,20 @@ Item {
     root.closingFromHost = false
   }
 
-  // True if the active document OR any other open tab has real unsaved
-  // edits — checked before forgetting everything on close (see
-  // _forgetEverythingOnClose() below). root.tabs only holds each
-  // INACTIVE tab's own last-snapshotted dirty flag; the active one's
-  // live state is root.dirty itself, not yet written back into tabs[].
-  function _anyUnsavedWork() {
-    if (root.dirty) return true
-    for (var i = 0; i < root.tabs.length; i++) {
-      if (root.tabs[i].id !== root.activeDocId && root.tabs[i].dirty) return true
-    }
-    return false
-  }
-
   // Gabriel's explicit ask, 2026-08-30, after a real cross-machine
   // data-loss incident (see the "no session persistence, by design"
   // comment further down for the full story): closing this app must
-  // forget whatever was open — not just across a shell restart, but on
-  // every ordinary close/reopen too. `keepLoaded: true` means the
-  // component would otherwise survive a plain close completely
-  // untouched, which is exactly what surprised him: closing the window
-  // alone wasn't enough, only a full shell restart forgot anything.
-  //
-  // Gated on _anyUnsavedWork() rather than called unconditionally:
-  // Hyprland's Super+W (Gabriel's own usual way of closing this plugin,
-  // see requestClose()'s own comment) kills the Wayland toplevel directly
-  // and never reaches requestClose()'s unsaved-changes confirm dialog at
-  // all — so if something is genuinely unsaved when the window closes
-  // this way, forgetting it unconditionally would silently destroy real
-  // work with zero warning, trading one data-loss bug for another. When
-  // there IS unsaved work, this intentionally does nothing — the
-  // existing `keepLoaded` safety net (the buffer survives untouched
-  // until the user reopens the window) stays exactly as it was. Only a
-  // genuinely clean close (nothing at risk) actually forgets — which is
-  // the ordinary case, and the one Gabriel actually complained about: an
-  // already-saved, no-longer-relevant document quietly hanging around in
-  // memory.
+  // forget whatever was open, ALWAYS, no exceptions — not just across a
+  // shell restart, but on every ordinary close too, dirty or not. First
+  // tried gating this on whether anything was genuinely unsaved (so nothing
+  // was ever silently destroyed) — Gabriel explicitly rejected that
+  // nuance too: "je ne veux aucune mémoire, jamais, de rien du tout... si
+  // j'ai oublié de sauvegarder un fichier, c'est tant pis pour moi." So
+  // this is now truly unconditional — an unsaved buffer left open when
+  // the window closes is simply gone, full stop. The one remaining
+  // safety net is requestClose()'s own confirm dialog (below), for the
+  // one close path where intercepting it is technically possible at all.
   function _forgetEverythingOnClose() {
-    if (root._anyUnsavedWork()) return
     root.tabs = [{ id: 1, path: "", text: "", dirty: false, notesText: "", rightPaneView: "apercu", loaded: false }]
     root._nextDocId = 2
     root.activeDocId = 1
@@ -93,16 +69,16 @@ Item {
   // The one gate every "the user wants to close this" path should go
   // through: if there's something unsaved, ask first instead of hiding
   // straight away. Known limitation, told to Gabriel directly rather than
-  // silently shipped: Hyprland's own window-close keybind (Super+W, his
-  // usual way of closing this plugin) kills the Wayland toplevel directly
-  // and never reaches this QML at all — Quickshell's FloatingWindow
-  // exposes no vetoable "closing" signal (checked its .qmltypes, only
-  // `visible`/`visibleChanged`) — so this only covers closes that go
-  // through the shell's own IPC (`hide`/`close`/`toggle`, e.g. from
-  // OmApp). The safety net for the Super+W path is still real, just
-  // different: `keepLoaded` means the component (and the in-memory
-  // buffer) survives a Super+W close untouched, so nothing is actually
-  // lost even without a prompt — reopening restores it exactly.
+  // silently shipped: Hyprland's own window-close keybind (Ctrl+W/Super+W,
+  // his usual way of closing this plugin) kills the Wayland toplevel
+  // directly and never reaches this QML at all — Quickshell's
+  // FloatingWindow exposes no vetoable "closing" signal (checked its
+  // .qmltypes, only `visible`/`visibleChanged`) — so this confirm dialog
+  // only ever fires for closes that go through the shell's own IPC
+  // (`hide`/`close`/`toggle`, e.g. from OmApp). Confirmed with Gabriel
+  // directly, 2026-08-30: he accepts this gap as-is (a keybind-driven
+  // close silently discards unsaved work, same as every other close now)
+  // rather than wanting anything more elaborate here.
   property bool showCloseConfirm: false
 
   function requestClose() {
@@ -2284,13 +2260,6 @@ Item {
         onCanceled: root.showCloseConfirm = false
         onConfirmed: {
           root.showCloseConfirm = false
-          // Explicitly resolved, not just ignored — this is what lets
-          // _forgetEverythingOnClose() (triggered right after, via
-          // window.visible going false) know the active document's
-          // unsaved state was a real, informed choice to discard, not
-          // something to silently protect. Any OTHER still-dirty tab is
-          // untouched and still blocks the reset on its own.
-          root.dirty = false
           root.close()
         }
       }
