@@ -135,6 +135,7 @@ Item {
   readonly property string pluginDir: homeDir + "/.config/omarchy/plugins/io.github.gabrielharfield.ghtypst"
   readonly property string stateDir: homeDir + "/.local/state/omarchy/plugins/io.github.gabrielharfield.ghtypst"
   readonly property string reviewsDir: stateDir + "/reviews"
+  readonly property string recentFilesPath: stateDir + "/recent.json"
   // Fixed, reused scratch files (not timestamped like reviewsDir) — this
   // is a high-frequency, single-flight operation with nothing to keep
   // per-run, same reasoning as previewSrcPath/pdfExportSrcPath below.
@@ -684,6 +685,7 @@ Item {
       }
       root.docText = docFile.text()
       root.dirty = false
+      root._recordRecentFile(root.docPath)
       compileDebounce.restart()
     }
     onLoadFailed: function(error) {
@@ -721,6 +723,7 @@ Item {
     }
     onSaved: {
       root.dirty = false
+      root._recordRecentFile(root.docPath)
       // "Enregistrer sous…" to a new path sets docPath first, which
       // reactively triggers this FileView's own load-fails-then-setText
       // chain (see suppressDocLoad above) — refreshFileTree() from
@@ -765,6 +768,7 @@ Item {
   Component.onCompleted: {
     ensureDirsProc.running = true
     Qt.callLater(function() { settingsFile.reload() })
+    Qt.callLater(function() { recentFilesFile.reload() })
     Qt.callLater(function() { root.refreshFileTree(root.fileTreeHomeDir()) })
   }
 
@@ -1335,6 +1339,32 @@ Item {
   property string fileTreeDir: ""
   property var fileTreeEntries: [] // [{name, isDir}]
   property bool fileTreeUserNavigated: false
+
+  // --- recent files (file-tree panel's quick-reopen list) -----------------
+  //
+  // Gabriel's own proposal, 2026-08-30, after the removed session-restore
+  // feature turned out too risky: only paths are ever remembered, never
+  // buffer content — reopening one is a plain, explicit openDocument()
+  // call that always reads whatever's actually on disk. See lib/Store.js's
+  // own comment for why this sidesteps the whole bug class that feature
+  // had.
+  property var recentFiles: [] // [path, ...], most-recent-first, max 5
+
+  FileView {
+    id: recentFilesFile
+    path: root.recentFilesPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.recentFiles = Store.parseRecentFiles(recentFilesFile.text())
+    onLoadFailed: root.recentFiles = []
+  }
+
+  function _recordRecentFile(path) {
+    if (!path) return
+    root.recentFiles = Store.pushRecentFile(root.recentFiles, path)
+    recentFilesFile.setText(Store.serializeRecentFiles(root.recentFiles))
+  }
   // Heading outline (=, ==, ===...) — a plain reactive binding, not
   // debounced: node-benchmarked at ~0ms even on the 62KB stress document
   // (lib/Outline.js's own comment), unlike the gutter/diff/spellcheck
@@ -1924,6 +1954,64 @@ Item {
                     onClicked: root.fileTreeGoHome()
                   }
                 }
+
+                // Recent files — Gabriel's own proposal, 2026-08-30, a
+                // safer replacement for the removed auto-restore-last-
+                // document feature: paths only, reopening is an explicit
+                // click through the normal openDocument()/discard-guard
+                // flow, so it always reads whatever's actually on disk
+                // right now, never a stale remembered buffer.
+                Column {
+                  width: parent.width
+                  spacing: Style.space(2)
+                  visible: root.recentFiles.length > 0
+
+                  Text {
+                    text: "Récents"
+                    color: root.faint
+                    font.family: root.uiFont
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Repeater {
+                    model: root.recentFiles
+
+                    Item {
+                      id: recentEntry
+                      required property string modelData
+                      width: parent.width
+                      height: recentEntryText.implicitHeight + Style.space(4)
+
+                      Text {
+                        id: recentEntryText
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        elide: Text.ElideMiddle
+                        text: "📄 " + root.fileBaseName(recentEntry.modelData)
+                        color: root.fg
+                        font.family: root.uiFont
+                        font.pixelSize: Style.font.bodySmall
+
+                        ToolTip.visible: recentMouseArea.containsMouse
+                        ToolTip.text: recentEntry.modelData
+                      }
+
+                      MouseArea {
+                        id: recentMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          var targetPath = recentEntry.modelData
+                          root.requestDiscardAndThen(function() { root.openDocument(targetPath) })
+                        }
+                      }
+                    }
+                  }
+                }
+
+                PanelSeparator { foreground: root.fg; width: parent.width; visible: root.recentFiles.length > 0 }
 
                 Text {
                   width: parent.width
