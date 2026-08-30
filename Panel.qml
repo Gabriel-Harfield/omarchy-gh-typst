@@ -74,13 +74,21 @@ Item {
   property bool showDiscardConfirm: false
   property var _pendingDiscardAction: null
 
-  function requestDiscardAndThen(action) {
-    if (root.dirty) {
+  // Generalized so closeTab() (below) can reuse the same confirm dialog
+  // for a tab that isn't necessarily the active one — requestDiscardAndThen
+  // itself is unchanged for every existing caller (all of which only ever
+  // meant "the active document").
+  function _confirmThenRun(isDirty, action) {
+    if (isDirty) {
       root._pendingDiscardAction = action
       root.showDiscardConfirm = true
     } else {
       action()
     }
+  }
+
+  function requestDiscardAndThen(action) {
+    root._confirmThenRun(root.dirty, action)
   }
 
   IpcHandler {
@@ -194,6 +202,169 @@ Item {
     if (root.docPath) notesSaveDebounce.restart()
   }
 
+  // --- open-documents tabs (multiple documents at once) -------------------
+  //
+  // Gabriel's ask, 2026-08-29: he needs more than one document open at a
+  // time, but this plugin is a single keepLoaded Item with one
+  // FloatingWindow — there's no "second instance" to open at the
+  // Quickshell/plugin level. An in-window tab strip (bottom-left, per his
+  // own spec) is the pragmatic equivalent, confirmed with him before
+  // starting. Deliberate scope for this first round, told to him directly
+  // rather than silently assumed: only the ACTIVE tab compiles, spell-
+  // checks, or can have a review/Antidote correction applied to it — no
+  // per-tab parallel Process/FileView pipelines, reusing this file's own
+  // hard-won lesson (see the compile-pipeline history above) that
+  // overlapping instances of those sharing singleton state is a real bug
+  // class here, not a theoretical one. Session persistence (session.json)
+  // still only remembers the single active document across a restart, same
+  // as before this feature — the other open tabs are not yet durable.
+  //
+  // root.docPath/docText/dirty/notesText/rightPaneView stay exactly what
+  // they always were: the ONE active document's live state, read/written
+  // everywhere else in this file completely unchanged. `tabs` is a
+  // lightweight side array caching the OTHER (inactive) open documents'
+  // state, snapshotted/restored around a switch — this way nothing
+  // downstream (the compile pipeline, spellcheck, notes, PDF export,
+  // review, Antidote) needed to change at all, they just keep reading the
+  // one "current document" surface they always did.
+  property var tabs: [{ id: 1, path: "", text: "", dirty: false, notesText: "", rightPaneView: "apercu", loaded: false }]
+  property int activeDocId: 1
+  property int _nextDocId: 2
+
+  // The tab bar's actual model: root.tabs with the active entry's path/
+  // dirty overlaid from the LIVE root.docPath/root.dirty rather than
+  // whatever was last snapshotted into it — so the bar's title and dirty
+  // dot for the current tab update immediately on every keystroke/save,
+  // without needing a snapshot on every single edit (only on an actual
+  // switch, see _snapshotActiveIntoTabs below).
+  readonly property var displayedTabs: root.tabs.map(function(t) {
+    if (t.id !== root.activeDocId) return t
+    return { id: t.id, path: root.docPath, text: "", dirty: root.dirty, notesText: "", rightPaneView: root.rightPaneView, loaded: true }
+  })
+
+  function tabTitle(t) {
+    return t.path ? root.fileBaseName(t.path) : "Sans titre"
+  }
+
+  // A review result awaiting "Appliquer", or an Antidote correction
+  // awaiting "Remplacer le document", both write straight into
+  // root.docText/root.dirty with no idea which tab that currently means —
+  // switching the active document out from under either one would apply
+  // the wrong document's correction onto whatever's now showing. Simplest
+  // safe rule rather than threading a "which document is this review for"
+  // id through both pipelines: block switching away while either has an
+  // unapplied result waiting, same spirit as the existing unsaved-changes
+  // guard elsewhere in this file.
+  readonly property bool _tabSwitchBlocked: root.reviewing || root.reviewHasResult || root.antidoteHasPreview
+
+  function _snapshotActiveIntoTabs() {
+    // Flush any pending (debounced) notes write for the outgoing document
+    // before switching — otherwise notesSaveDebounce fires later against
+    // whatever notesPath the newly-active document has by then (notesPath
+    // is derived from docPath, which is about to change), silently
+    // dropping the outgoing edit instead of saving it.
+    if (notesSaveDebounce.running) {
+      notesSaveDebounce.stop()
+      if (root.docPath) notesFile.setText(root.notesText)
+    }
+    root.tabs = root.tabs.map(function(t) {
+      if (t.id !== root.activeDocId) return t
+      return { id: t.id, path: root.docPath, text: root.docText, dirty: root.dirty,
+               notesText: root.notesText, rightPaneView: root.rightPaneView, loaded: true }
+    })
+  }
+
+  // Loads a tabs[] entry into the live "current document" surface. Reuses
+  // docFile's existing pendingRestore reconciliation (the same mechanism
+  // session-restore already relies on) for a real path with cached
+  // in-memory content — if the cached text differs from what's actually on
+  // disk, the cache wins and dirty is set, exactly like restoring an
+  // unsaved edit after a shell restart. A tab that's never been loaded yet
+  // (freshly opened into a brand-new tab via "+") does a plain disk load
+  // instead, same as an ordinary openDocument().
+  function _loadTabIntoActive(tab) {
+    root.activeDocId = tab.id
+    root.rightPaneView = tab.rightPaneView || "apercu"
+    // Undo history is per-EditorTab-instance, not per-tab (see EditorTab's
+    // own undo()/redo() comment) — cleared explicitly at the one moment
+    // the active document's identity actually changes, so undoing never
+    // crosses between two different documents.
+    editorTabItem.clearUndoHistory()
+    // Cleared unconditionally rather than left stale — see previewVersion/
+    // previewPageCount's own note in the compile pipeline: previewDir
+    // updates the instant docPath does, and a stale version/page-count
+    // paired with a new directory would briefly point at files that don't
+    // exist there until the next compile finishes.
+    root.compileErrors = []
+    root.previewVersion = 0
+    root.previewPageCount = 0
+    root.suppressDocLoad = false
+    if (tab.path === "") {
+      // Untitled tab: no FileView involved at all, same as newDocument().
+      root.pendingRestore = false
+      root.docPath = ""
+      root.docText = tab.text
+      root.dirty = tab.dirty
+      if (root.previewEnabled && root.docText !== "") root.scheduleCompile()
+      return
+    }
+    if (tab.loaded) {
+      root.pendingRestoreBuffer = tab.text
+      root.pendingRestore = true
+    } else {
+      root.pendingRestore = false
+    }
+    if (tab.path === root.docPath) {
+      // docPath binding won't refire on its own since the value isn't
+      // actually changing — force it, same trick openDocument() already
+      // uses for the identical case.
+      docFile.reload()
+    } else {
+      root.docPath = tab.path
+    }
+  }
+
+  function switchToTab(id) {
+    if (id === root.activeDocId || root._tabSwitchBlocked) return
+    root._snapshotActiveIntoTabs()
+    var target = null
+    for (var i = 0; i < root.tabs.length; i++) if (root.tabs[i].id === id) { target = root.tabs[i]; break }
+    if (!target) return
+    root._loadTabIntoActive(target)
+  }
+
+  function addTab() {
+    if (root._tabSwitchBlocked) return
+    root._snapshotActiveIntoTabs()
+    var id = root._nextDocId++
+    var t = { id: id, path: "", text: "", dirty: false, notesText: "", rightPaneView: "apercu", loaded: true }
+    root.tabs = root.tabs.concat([t])
+    root._loadTabIntoActive(t)
+  }
+
+  function closeTab(id) {
+    var idx = -1
+    for (var i = 0; i < root.tabs.length; i++) if (root.tabs[i].id === id) { idx = i; break }
+    if (idx === -1) return
+    var isActive = (id === root.activeDocId)
+    if (isActive && root._tabSwitchBlocked) return
+    var tabDirty = isActive ? root.dirty : root.tabs[idx].dirty
+    root._confirmThenRun(tabDirty, function() {
+      var remaining = root.tabs.filter(function(x) { return x.id !== id })
+      if (remaining.length === 0) {
+        // Always at least one tab open — recreate a blank one rather than
+        // leaving nothing.
+        var freshId = root._nextDocId++
+        remaining = [{ id: freshId, path: "", text: "", dirty: false, notesText: "", rightPaneView: "apercu", loaded: true }]
+      }
+      root.tabs = remaining
+      if (isActive) {
+        var newActive = remaining[Math.min(idx, remaining.length - 1)]
+        root._loadTabIntoActive(newActive)
+      }
+    })
+  }
+
   property string tab: "editor" // "editor" | "revision" | "settings"
 
   function windowTitle() {
@@ -219,10 +390,12 @@ Item {
     root.compileErrors = []
     root.previewVersion = 0
     root.previewPageCount = 0
+    editorTabItem.clearUndoHistory()
     root.scheduleSessionSave()
   }
 
   function openDocument(path) {
+    editorTabItem.clearUndoHistory()
     root.suppressDocLoad = false
     // Defensive reset: a stale true here (left over from an interrupted
     // session-restore) would make docFile.onLoaded treat this fresh open
@@ -1326,6 +1499,10 @@ Item {
       Keys.onPressed: function(event) {
         if (root.showCloseConfirm && closeConfirmDialog.handleKey(event)) event.accepted = true
         else if (root.showDiscardConfirm && discardConfirmDialog.handleKey(event)) event.accepted = true
+        else if (root.tab === "editor" && event.key === Qt.Key_F && (event.modifiers & Qt.ControlModifier)) {
+          editorTabItem.toggleFindBar()
+          event.accepted = true
+        }
       }
 
       Column {
@@ -1490,7 +1667,11 @@ Item {
         // -------------------------------------------------------- body
         Item {
           width: parent.width
-          height: parent.height - Style.space(60)
+          // Style.space(60): pre-existing budget for the header/pdf-status/
+          // path-bar rows above. docTabBarRow.implicitHeight + Style.space(10):
+          // room for the new open-documents tab bar below, plus the extra
+          // Column spacing gap it introduces.
+          height: parent.height - Style.space(60) - docTabBarRow.implicitHeight - Style.space(10)
 
           Item {
             id: editorBody
@@ -1769,6 +1950,66 @@ Item {
             uiFont: root.uiFont
             onAutosaveEnabledSet: function(enabled) { root.setAutosaveEnabled(enabled) }
             onAutosaveMinutesSet: function(minutes) { root.setAutosaveMinutes(minutes) }
+          }
+        }
+
+        // ------------------------------------------ open-documents tabs
+        //
+        // Bottom-left, visible across Éditeur/Révision/Paramètres alike —
+        // Gabriel's own spec, 2026-08-29. "+" sits first, directly under
+        // the file-tree panel's own left edge.
+        Item {
+          width: parent.width
+          height: docTabBarRow.implicitHeight
+
+          Row {
+            id: docTabBarRow
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(6)
+
+            Button {
+              iconText: ""
+              tooltipText: root._tabSwitchBlocked
+                ? "Termine ou annule la vérification/correction en cours avant d'ouvrir un nouvel onglet."
+                : "Nouvel onglet"
+              enabled: !root._tabSwitchBlocked
+              foreground: root.fg
+              accent: root.accentColor
+              onClicked: root.addTab()
+            }
+
+            Repeater {
+              model: root.displayedTabs
+
+              Row {
+                id: tabEntry
+                required property var modelData
+                readonly property bool isActive: modelData.id === root.activeDocId
+                readonly property bool switchBlocked: root._tabSwitchBlocked && !isActive
+                spacing: Style.space(2)
+
+                Button {
+                  text: root.tabTitle(tabEntry.modelData) + (tabEntry.modelData.dirty ? " •" : "")
+                  selected: tabEntry.isActive
+                  enabled: !tabEntry.switchBlocked
+                  tooltipText: tabEntry.switchBlocked
+                    ? "Termine ou annule la vérification/correction en cours avant de changer de document."
+                    : (tabEntry.modelData.path || "Document sans titre")
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.switchToTab(tabEntry.modelData.id)
+                }
+                Button {
+                  iconText: ""
+                  tooltipText: "Fermer l'onglet"
+                  enabled: tabEntry.isActive ? !root._tabSwitchBlocked : true
+                  foreground: root.dim
+                  accent: root.accentColor
+                  onClicked: root.closeTab(tabEntry.modelData.id)
+                }
+              }
+            }
           }
         }
       }

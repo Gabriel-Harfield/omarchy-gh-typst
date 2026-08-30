@@ -91,6 +91,206 @@ Item {
     root._notesProgrammatic = false
   }
 
+  // --- rechercher / remplacer (Ctrl+F) ------------------------------------
+  //
+  // Gabriel's ask, 2026-08-29. Fully local to this component — findQuery/
+  // replaceQuery are plain user-driven inputs, only ever written from
+  // outside the fields themselves at openFindBar() time (seeding from a
+  // selection), so findField/replaceField skip the declarative `text:`
+  // binding entirely (same established trap as pathBarField/notesField
+  // elsewhere in this codebase — a TextField's binding is destroyed the
+  // instant the user types into it) and are seeded imperatively instead.
+  //
+  // Case-insensitive substring search only for this first version (no
+  // regex) — the simplest thing that's actually useful for prose, and
+  // still useful for Typst code even if it can over-match on
+  // capitalization; a case-sensitive toggle would be a small, separate
+  // follow-up if ever wanted.
+  property bool findBarOpen: false
+  property string findQuery: ""
+  property string replaceQuery: ""
+  property var findMatches: [] // [{start,end}], offsets into _lastPlainText
+  property int findCurrentIndex: -1
+  property int _lastReplaceAllCount: -1
+
+  function _computeMatches(text, query) {
+    var out = []
+    if (!query) return out
+    var hay = text.toLowerCase()
+    var needle = query.toLowerCase()
+    var i = 0
+    while (true) {
+      var idx = hay.indexOf(needle, i)
+      if (idx === -1) break
+      out.push({ start: idx, end: idx + needle.length })
+      i = idx + needle.length
+    }
+    return out
+  }
+
+  // Recomputes findMatches against the current _lastPlainText WITHOUT
+  // resetting findCurrentIndex to 0 — called after every re-render (see
+  // renderPlainText()'s own Qt.callLater block) so a replaceCurrent()
+  // "advances" for free: removing one match from the array naturally
+  // shifts the next one into the same numeric index. Query-driven
+  // searches (the user typing a new term) reset the index explicitly
+  // themselves before calling this, via onFindQueryEdited below.
+  function _recomputeFindMatches() {
+    root.findMatches = root._computeMatches(root._lastPlainText, root.findQuery)
+    if (root.findMatches.length === 0) {
+      root.findCurrentIndex = -1
+      inputEdit.deselect()
+      return
+    }
+    if (root.findCurrentIndex < 0 || root.findCurrentIndex >= root.findMatches.length)
+      root.findCurrentIndex = 0
+    root._applySelection()
+  }
+
+  function _applySelection() {
+    if (root.findCurrentIndex < 0 || root.findCurrentIndex >= root.findMatches.length) return
+    var m = root.findMatches[root.findCurrentIndex]
+    inputEdit.select(m.start, m.end)
+    root.ensureCursorVisible()
+  }
+
+  function openFindBar() {
+    root.findBarOpen = true
+    root._lastReplaceAllCount = -1
+    // Seed with the current selection, mirroring the usual Ctrl+F
+    // convention elsewhere — only for a plain single-line selection, a
+    // multi-line one is almost never what someone means to search for.
+    var sel = inputEdit.selectedText
+    if (sel && sel.length > 0 && sel.indexOf("\n") === -1) root.findQuery = sel
+    // Imperative, not a binding — see findField's own comment for why.
+    findField.text = root.findQuery
+    root.findCurrentIndex = 0
+    root._recomputeFindMatches()
+    Qt.callLater(function() { findField.forceActiveFocus(); findField.selectAll() })
+  }
+
+  function closeFindBar() {
+    root.findBarOpen = false
+    inputEdit.deselect()
+    inputEdit.forceActiveFocus()
+  }
+
+  // Ctrl+F now toggles (Gabriel's ask, 2026-08-29, alongside docking the
+  // bar below the editor instead of floating over the text) — Panel.qml's
+  // shortcut handler calls this instead of openFindBar() directly.
+  function toggleFindBar() {
+    if (root.findBarOpen) root.closeFindBar()
+    else root.openFindBar()
+  }
+
+  function onFindQueryEdited(text) {
+    root.findQuery = text
+    root.findCurrentIndex = 0
+    root._lastReplaceAllCount = -1
+    root._recomputeFindMatches()
+  }
+
+  function findNext() {
+    if (root.findMatches.length === 0) return
+    root.findCurrentIndex = (root.findCurrentIndex + 1) % root.findMatches.length
+    root._applySelection()
+  }
+
+  function findPrevious() {
+    if (root.findMatches.length === 0) return
+    root.findCurrentIndex = (root.findCurrentIndex - 1 + root.findMatches.length) % root.findMatches.length
+    root._applySelection()
+  }
+
+  function replaceCurrent() {
+    if (root.findCurrentIndex < 0 || root.findCurrentIndex >= root.findMatches.length) return
+    var m = root.findMatches[root.findCurrentIndex]
+    var t = root._lastPlainText
+    var newText = t.slice(0, m.start) + root.replaceQuery + t.slice(m.end)
+    root.textEdited(newText)
+  }
+
+  function replaceAll() {
+    if (root.findMatches.length === 0) return
+    var t = root._lastPlainText
+    var parts = []
+    var last = 0
+    for (var i = 0; i < root.findMatches.length; i++) {
+      var m = root.findMatches[i]
+      parts.push(t.slice(last, m.start))
+      parts.push(root.replaceQuery)
+      last = m.end
+    }
+    parts.push(t.slice(last))
+    root._lastReplaceAllCount = root.findMatches.length
+    root.textEdited(parts.join(""))
+  }
+
+  // --- undo / redo (Ctrl+Z / Ctrl+R) --------------------------------------
+  //
+  // Gabriel's ask, 2026-08-29, prompted directly by the autosave incident
+  // during find/replace testing — a proper undo would have been the
+  // natural recovery tool instead of manually reconstructing the lost
+  // text. Explicitly Ctrl+R for redo (not Ctrl+Shift+Z/Ctrl+Y), per his
+  // own wording.
+  //
+  // A from-scratch app-level stack, NOT TextEdit's native undo — this
+  // file's own history already established why: renderPlainText()
+  // reassigns inputEdit.text wholesale on every recolor pass, which
+  // confuses/resets Qt's native undo stack (see this file's header
+  // comment history). Snapshots are plain-text strings, pushed once per
+  // renderPlainText() call (i.e. once per "pause in typing", or once per
+  // programmatic edit like replace/replace-all/Claude-apply/Antidote-
+  // apply/tab-switch) rather than once per keystroke — same granularity
+  // as the recolor debounce, which gives a natural "undo the last burst
+  // of typing" feel rather than one character at a time.
+  //
+  // Deliberately NOT per-tab: this stack lives on EditorTab (a single,
+  // persistent component reused across every open document, per the
+  // multi-tab feature) rather than inside Panel.qml's tabs[] array —
+  // switching documents (tab switch, Ouvrir, Nouveau) calls
+  // clearUndoHistory() explicitly from Panel.qml at the exact moments the
+  // active document's identity changes, so undo never crosses between two
+  // different documents. Known, disclosed scope limit: switching away and
+  // back to a tab loses that tab's undo history, unlike a real per-tab
+  // stack would. Reasonable tradeoff given this was built under a tight
+  // remaining-budget constraint the same session.
+  property var _undoStack: []
+  property int _undoPos: -1
+  property bool _undoRedoInProgress: false
+  readonly property int _undoStackLimit: 100
+
+  function clearUndoHistory() {
+    root._undoStack = []
+    root._undoPos = -1
+  }
+
+  function _pushUndoSnapshot(text) {
+    if (root._undoRedoInProgress) return
+    if (root._undoPos >= 0 && root._undoStack[root._undoPos] === text) return
+    var truncated = root._undoStack.slice(0, root._undoPos + 1)
+    truncated.push(text)
+    if (truncated.length > root._undoStackLimit) truncated.shift()
+    root._undoStack = truncated
+    root._undoPos = root._undoStack.length - 1
+  }
+
+  function undo() {
+    if (root._undoPos <= 0) return
+    root._undoPos -= 1
+    root._undoRedoInProgress = true
+    root.textEdited(root._undoStack[root._undoPos])
+    root._undoRedoInProgress = false
+  }
+
+  function redo() {
+    if (root._undoPos < 0 || root._undoPos >= root._undoStack.length - 1) return
+    root._undoPos += 1
+    root._undoRedoInProgress = true
+    root.textEdited(root._undoStack[root._undoPos])
+    root._undoRedoInProgress = false
+  }
+
   readonly property string monoFont: "monospace"
   readonly property real editorFontSize: Math.max(6, Math.round(Style.font.body * root.zoom))
 
@@ -131,6 +331,7 @@ Item {
     var savedPos = inputEdit.cursorPosition
     inputEdit.text = Highlighter.toHtml(plain)
     root._lastPlainText = plain
+    root._pushUndoSnapshot(plain)
     // Gutter text lags one recolor pass behind _lastPlainText on purpose
     // — see _gutterText's own comment below for why.
     root._gutterText = plain
@@ -147,6 +348,13 @@ Item {
       // own comment for why this can't just react to cursorPositionChanged
       // during the swap itself.
       root._updateCurrentLine()
+      // Keeps the find/replace match list (and the current selection) in
+      // sync with every re-render, not just ones triggered by find/replace
+      // itself — covers live typing while the bar is open, and is also
+      // what makes replaceCurrent()'s "advance to the next match" work for
+      // free: removing one match from the array naturally shifts the next
+      // one into the same numeric findCurrentIndex.
+      if (root.findBarOpen) root._recomputeFindMatches()
     })
     // Confirmed live 2026-08-27: right after this synchronous text
     // assignment, positionToRectangle() on most of the document is still
@@ -438,7 +646,7 @@ Item {
       ScrollView {
         id: editorScroll
         width: parent.width
-        height: parent.height - editorHeader.height - parent.spacing - errorList.height - (errorList.visible ? Style.space(8) : 0)
+        height: parent.height - editorHeader.height - parent.spacing - errorList.height - (errorList.visible ? Style.space(8) : 0) - (findBarDock.visible ? (findBarDock.height + Style.space(8)) : 0)
         clip: true
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
@@ -635,6 +843,25 @@ Item {
             persistentSelection: true
             cursorVisible: true
 
+            // Intercepts Ctrl+Z/Ctrl+R before TextEdit's own native undo
+            // (bound to Ctrl+Z by default) ever sees them — BeforeItem
+            // priority runs this ahead of the item's built-in key
+            // handling, and event.accepted = true stops it from falling
+            // through afterward. Necessary because the native undo stack
+            // is unusable here (see undo()/redo()'s own comment above):
+            // renderPlainText()'s wholesale inputEdit.text reassignment on
+            // every recolor pass confuses it.
+            Keys.priority: Keys.BeforeItem
+            Keys.onPressed: function(event) {
+              if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Z) {
+                root.undo()
+                event.accepted = true
+              } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_R) {
+                root.redo()
+                event.accepted = true
+              }
+            }
+
             onCursorRectangleChanged: root.ensureLastLineVisible()
             // Skipped during a programmatic text swap (recolor pass) —
             // cursorPosition is transiently unstable in that exact window,
@@ -667,6 +894,137 @@ Item {
             interval: 300
             repeat: false
             onTriggered: root.renderPlainText(root._lastPlainText)
+          }
+        }
+      }
+
+      // ------------------------------------------------------ find/replace
+      //
+      // Docked below the editor, not floating over it — Gabriel found the
+      // original floating overlay covered the text and couldn't be moved
+      // out of the way. A normal Column child, sized to 0 and skipped by
+      // Column's own layout when closed (visible: root.findBarOpen), same
+      // pattern errorList below already uses — editorScroll's own height
+      // formula above subtracts this bar's height when open, exactly like
+      // it already does for errorList.
+      Rectangle {
+        id: findBarDock
+        visible: root.findBarOpen
+        width: parent.width
+        height: findBarColumn.implicitHeight + Style.space(16)
+        color: Qt.darker(root.background, 1.15)
+        border.color: root.accentColor
+        border.width: 1
+        radius: Style.cornerRadius
+        clip: true
+
+        Column {
+          id: findBarColumn
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          spacing: Style.space(6)
+
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            TextField {
+              id: findField
+              width: parent.width - Style.space(190)
+              placeholderText: "Rechercher…"
+              // No declarative `text:` binding — this codebase's own established
+              // trap (see pathBarField/notesField's comments): a TextField's
+              // binding is destroyed the instant the user types, so it would
+              // only ever seed correctly once. findQuery only ever changes from
+              // outside this field at openFindBar() time (seeding from a
+              // selection), handled there via a direct imperative assignment.
+              onTextChanged: root.onFindQueryEdited(text)
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) { root.closeFindBar(); event.accepted = true }
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  if (event.modifiers & Qt.ShiftModifier) root.findPrevious(); else root.findNext()
+                  event.accepted = true
+                }
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(70)
+              text: root.findMatches.length > 0
+                ? (root.findCurrentIndex + 1) + "/" + root.findMatches.length
+                : (root.findQuery ? "Aucun résultat" : "")
+              color: root.faint
+              font.family: root.uiFont
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Button {
+              iconText: ""
+              tooltipText: "Précédent (Maj+Entrée)"
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.findPrevious()
+            }
+            Button {
+              iconText: ""
+              tooltipText: "Suivant (Entrée)"
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.findNext()
+            }
+            Button {
+              iconText: ""
+              tooltipText: "Fermer (Ctrl+F, Échap)"
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.closeFindBar()
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            TextField {
+              id: replaceField
+              // Narrower reservation than findField's row above — this row's
+              // two text buttons ("Remplacer"/"Tout remplacer") need more room
+              // than row one's three icon-only ones.
+              width: parent.width - Style.space(260)
+              placeholderText: "Remplacer par…"
+              onTextChanged: root.replaceQuery = text
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) { root.closeFindBar(); event.accepted = true }
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.replaceCurrent(); event.accepted = true }
+              }
+            }
+
+            Button {
+              text: "Remplacer"
+              enabled: root.findMatches.length > 0
+              bordered: true
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.replaceCurrent()
+            }
+            Button {
+              text: "Tout remplacer"
+              enabled: root.findMatches.length > 0
+              bordered: true
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.replaceAll()
+            }
+          }
+
+          Text {
+            visible: root._lastReplaceAllCount >= 0
+            width: parent.width
+            text: root._lastReplaceAllCount + " remplacement(s) effectué(s)."
+            color: root.dim
+            font.family: root.uiFont
+            font.pixelSize: Style.font.bodySmall
           }
         }
       }
@@ -888,3 +1246,4 @@ Item {
     }
   }
 }
+
