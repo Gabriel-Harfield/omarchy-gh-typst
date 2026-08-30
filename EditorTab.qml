@@ -1379,6 +1379,12 @@ Item {
             id: journalCalendar
             width: parent.width
             spacing: Style.space(6)
+            // Capped so the calendar stays a small, fixed-size widget even
+            // on a wide/fullscreen pane — Gabriel's ask, 2026-08-30 ("le
+            // calendrier prend beaucoup trop de place en plein écran").
+            // Only shrinks below the cap on a genuinely narrow pane, never
+            // grows past it.
+            readonly property real cellSize: Math.min(Style.space(36), (width - Style.space(2) * 6) / 7)
 
             Row {
               width: parent.width
@@ -1410,12 +1416,13 @@ Item {
             }
 
             Row {
-              width: parent.width
+              width: journalCalendar.cellSize * 7
+              anchors.horizontalCenter: parent.horizontalCenter
               Repeater {
                 model: ["L", "M", "M", "J", "V", "S", "D"]
                 Text {
                   required property string modelData
-                  width: (parent.width) / 7
+                  width: journalCalendar.cellSize
                   horizontalAlignment: Text.AlignHCenter
                   text: modelData
                   color: root.faint
@@ -1426,7 +1433,8 @@ Item {
             }
 
             Grid {
-              width: parent.width
+              width: journalCalendar.cellSize * 7 + Style.space(2) * 6
+              anchors.horizontalCenter: parent.horizontalCenter
               columns: 7
               columnSpacing: Style.space(2)
               rowSpacing: Style.space(2)
@@ -1446,8 +1454,8 @@ Item {
                     && root.journalViewMonth === (root._journalToday.getMonth() + 1)
                   readonly property bool hasEntry: isDay && root.journalEntryDays[modelData] === true
 
-                  width: (parent.width - Style.space(2) * 6) / 7
-                  height: width
+                  width: journalCalendar.cellSize
+                  height: journalCalendar.cellSize
                   radius: Style.cornerRadius
                   color: isSelected ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.35) : "transparent"
                   border.color: isToday ? root.accentColor : "transparent"
