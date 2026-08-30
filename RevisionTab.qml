@@ -55,6 +55,7 @@ Item {
   signal sendRequested()
   signal fetchRequested()
   signal antidoteApplyRequested()
+  signal antidoteDictionaryRequested()
 
   signal reviewRequested(string kind, string mode, string extraInstructions)
   signal applyRequested(string finalText)
@@ -186,6 +187,15 @@ Item {
             foreground: root.foreground
             accent: root.accentColor
             onClicked: root.fetchRequested()
+          }
+
+          Button {
+            iconText: "\uf02d"
+            text: "Dictionnaire Antidote"
+            bordered: true
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: root.antidoteDictionaryRequested()
           }
         }
 

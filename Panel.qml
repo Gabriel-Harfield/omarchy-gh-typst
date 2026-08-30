@@ -866,6 +866,24 @@ Item {
   // Antidote in Chromium (not his default browser, which is Zen).
 
   readonly property string antidoteUrl: "https://antidote.app/correcteur"
+  readonly property string typstDocsUrl: "https://typst.app/docs/"
+  readonly property string typstUniverseUrl: "https://typst.app/universe/"
+  readonly property string antidoteDictionaryUrl: "https://antidote.app/dictionnaires/fr/definitions/FRUAgAAAABGUgCJYwEAiWMBAEQAAACKTm9tIHByb3ByZYhBbnRpZG90ZYCAgA%3D%3D3e4a/RlLvh7c5MTAxN%2B%2BHt05vbSBwcm9wcmU%3D/RlLvh7c5MTAxN%2B%2BHt05vbSBwcm9wcmXvh7dBbnRpZG90Ze%2BHt2FudGlkb3Rl"
+
+  // --- generic webapp launcher --------------------------------------------
+  //
+  // `chromium --app=<url>` opens a minimal, tab/URL-bar-less window —
+  // reused as-is by Aide (Typst Docs), the Typst Universe template picker,
+  // and the Antidote dictionary button, all sharing this one Process
+  // instead of each repeating the same two-line pattern antidoteOpenProc
+  // established first.
+  function openWebapp(url) {
+    webappOpenProc.command = ["chromium", "--app=" + url]
+    webappOpenProc.running = false
+    webappOpenProc.running = true
+  }
+
+  Process { id: webappOpenProc }
 
   property bool antidoteSending: false
   property string antidoteSendError: ""
@@ -1305,6 +1323,8 @@ Item {
   property real editorZoom: 1.0
   property bool previewEnabled: true
   property bool lineNumbersEnabled: true
+  property bool narrowMarginsEnabled: false
+  property bool rightPaneHidden: false
   property string claudeModel: "" // "" | "sonnet" | "opus" | "haiku" | "fable" — "" = claude -p's own default
   property string claudeEffort: "" // "" | "low" | "medium" | "high" | "xhigh" | "max"
 
@@ -1325,6 +1345,8 @@ Item {
     root.editorZoom = parsed.editorZoom
     root.previewEnabled = parsed.previewEnabled
     root.lineNumbersEnabled = parsed.lineNumbersEnabled
+    root.narrowMarginsEnabled = parsed.narrowMarginsEnabled
+    root.rightPaneHidden = parsed.rightPaneHidden
     root.claudeModel = parsed.claudeModel
     root.claudeEffort = parsed.claudeEffort
     root.settingsLoaded = true
@@ -1340,6 +1362,8 @@ Item {
       editorZoom: root.editorZoom,
       previewEnabled: root.previewEnabled,
       lineNumbersEnabled: root.lineNumbersEnabled,
+      narrowMarginsEnabled: root.narrowMarginsEnabled,
+      rightPaneHidden: root.rightPaneHidden,
       claudeModel: root.claudeModel,
       claudeEffort: root.claudeEffort
     }))
@@ -1375,6 +1399,16 @@ Item {
 
   function setLineNumbersEnabled(enabled) {
     root.lineNumbersEnabled = enabled
+    root.scheduleSettingsSave()
+  }
+
+  function setNarrowMarginsEnabled(enabled) {
+    root.narrowMarginsEnabled = enabled
+    root.scheduleSettingsSave()
+  }
+
+  function setRightPaneHidden(hidden) {
+    root.rightPaneHidden = hidden
     root.scheduleSettingsSave()
   }
 
@@ -1556,6 +1590,13 @@ Item {
                 accent: root.accentColor
                 onClicked: root.tab = "settings"
               }
+              Button {
+                iconText: ""
+                text: "Aide"
+                foreground: root.fg
+                accent: root.accentColor
+                onClicked: root.openWebapp(root.typstDocsUrl)
+              }
             }
           }
 
@@ -1706,7 +1747,7 @@ Item {
                     onClicked: root.fileTreeGoUp()
                   }
                   Button {
-                    text: "🏠"
+                    iconText: ""
                     tooltipText: "Dossier du document"
                     foreground: root.fg
                     accent: root.accentColor
@@ -1878,6 +1919,8 @@ Item {
               zoom: root.editorZoom
               previewEnabled: root.previewEnabled
               lineNumbersEnabled: root.lineNumbersEnabled
+              narrowMarginsEnabled: root.narrowMarginsEnabled
+              rightPaneHidden: root.rightPaneHidden
               spellcheckAvailable: root.spellcheckAvailable
               misspelledWords: root.misspelledWords
               suggestWord: root.suggestWord
@@ -1892,6 +1935,8 @@ Item {
               onZoomOutRequested: root.setEditorZoom(root.editorZoom - 0.1)
               onPreviewToggleRequested: root.setPreviewEnabled(!root.previewEnabled)
               onLineNumbersToggleRequested: root.setLineNumbersEnabled(!root.lineNumbersEnabled)
+              onNarrowMarginsToggleRequested: root.setNarrowMarginsEnabled(!root.narrowMarginsEnabled)
+              onRightPaneHiddenToggleRequested: root.setRightPaneHidden(!root.rightPaneHidden)
               onSpellcheckRequested: function(text) { root.requestSpellcheck(text) }
               onSuggestRequested: function(word) { root.requestSuggestions(word) }
               onApplySuggestionRequested: function(start, end, replacement) { root.applySuggestion(start, end, replacement) }
@@ -1931,6 +1976,7 @@ Item {
             onSendRequested: root.sendToAntidote()
             onFetchRequested: root.fetchAntidoteClipboard()
             onAntidoteApplyRequested: root.applyAntidoteCorrection()
+            onAntidoteDictionaryRequested: root.openWebapp(root.antidoteDictionaryUrl)
             onReviewRequested: function(kind, mode, extra) { root.startCodeReview(kind, mode, extra) }
             onApplyRequested: function(finalText) { root.applyReviewCorrection(finalText) }
             onCancelRequested: root.cancelCodeReview()

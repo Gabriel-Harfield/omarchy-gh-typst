@@ -38,6 +38,14 @@ Item {
   required property real zoom
   required property bool previewEnabled
   required property bool lineNumbersEnabled
+  required property bool narrowMarginsEnabled
+  // Whether the whole Aperçu/Notes right pane is collapsed, giving the
+  // editor the full width — Gabriel's ask, 2026-08-29 ("investigate
+  // hiding the Aperçu/Notes section"), left to my own design call on
+  // exact UX. A single toggle in the editor's own header (always
+  // reachable, in both states) rather than one only visible from the
+  // preview side, which would strand the user with no way back.
+  required property bool rightPaneHidden
   // Local system spellcheck (hunspell, no Claude) — Gabriel's explicit
   // ask, 2026-08-29. misspelledWords is Panel.qml's latest detection
   // result ([{word,start,end}], offsets into the *plain text*, always
@@ -73,6 +81,8 @@ Item {
   signal zoomOutRequested()
   signal previewToggleRequested()
   signal lineNumbersToggleRequested()
+  signal narrowMarginsToggleRequested()
+  signal rightPaneHiddenToggleRequested()
   signal spellcheckRequested(string text)
   signal suggestRequested(string word)
   signal applySuggestionRequested(int start, int end, string replacement)
@@ -293,6 +303,11 @@ Item {
 
   readonly property string monoFont: "monospace"
   readonly property real editorFontSize: Math.max(6, Math.round(Style.font.body * root.zoom))
+  // Extra breathing room added to both sides of the text column when
+  // "marges étroites" is on — narrows the reading column on large
+  // monitors without touching the line-number gutter, which stays
+  // pinned to the left edge regardless.
+  readonly property real narrowMarginExtra: root.narrowMarginsEnabled ? Style.space(160) : 0
 
   // Last plain text known to be reflected in inputEdit's rendered HTML —
   // the single source of truth used to decide whether an external `text`
@@ -554,11 +569,11 @@ Item {
 
   Row {
     anchors.fill: parent
-    spacing: Style.space(14)
+    spacing: root.rightPaneHidden ? 0 : Style.space(14)
 
     // ------------------------------------------------ left: code editor
     Column {
-      width: parent.width * 0.52
+      width: root.rightPaneHidden ? parent.width : parent.width * 0.52
       height: parent.height
       spacing: Style.space(8)
 
@@ -618,6 +633,17 @@ Item {
             accent: root.accentColor
             onClicked: root.lineNumbersToggleRequested()
           }
+          Item { width: Style.space(6); height: 1 }
+          Button {
+            iconText: ""
+            selected: root.narrowMarginsEnabled
+            tooltipText: root.narrowMarginsEnabled
+              ? "Désactiver les marges étroites"
+              : "Marges étroites (réduit la largeur du texte pour les grands écrans)"
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: root.narrowMarginsToggleRequested()
+          }
           Item { width: Style.space(10); height: 1 }
           Button {
             text: "−"
@@ -639,6 +665,21 @@ Item {
             foreground: root.foreground
             accent: root.accentColor
             onClicked: root.zoomInRequested()
+          }
+          Item { width: Style.space(10); height: 1 }
+          // Collapses the whole Aperçu/Notes right pane so the editor
+          // takes the full width — lives here (not on the preview side)
+          // so it's reachable in both states, never stranding the user
+          // with no way back once the pane is hidden.
+          Button {
+            iconText: root.rightPaneHidden ? "" : ""
+            selected: root.rightPaneHidden
+            tooltipText: root.rightPaneHidden
+              ? "Réafficher le panneau Aperçu/Notes"
+              : "Masquer le panneau Aperçu/Notes (l'éditeur prend toute la largeur)"
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: root.rightPaneHiddenToggleRequested()
           }
         }
       }
@@ -832,7 +873,8 @@ Item {
             id: inputEdit
             anchors.fill: parent
             anchors.margins: Style.space(12)
-            anchors.leftMargin: root.lineNumbersEnabled ? (root.gutterWidth + Style.space(12)) : Style.space(12)
+            anchors.leftMargin: (root.lineNumbersEnabled ? (root.gutterWidth + Style.space(12)) : Style.space(12)) + root.narrowMarginExtra
+            anchors.rightMargin: Style.space(12) + root.narrowMarginExtra
             textFormat: TextEdit.RichText
             color: root.foreground
             selectionColor: Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.35)
@@ -1071,7 +1113,8 @@ Item {
 
     // --------------------------------------------------- right: preview
     Column {
-      width: parent.width - parent.spacing - (parent.width * 0.52)
+      visible: !root.rightPaneHidden
+      width: visible ? (parent.width - parent.spacing - (parent.width * 0.52)) : 0
       height: parent.height
       spacing: Style.space(8)
 
