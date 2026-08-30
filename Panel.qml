@@ -394,6 +394,19 @@ Item {
     root.scheduleSessionSave()
   }
 
+  // Typst Universe template picker (Paramètres tab) — opens in a brand-new
+  // tab rather than replacing whatever's currently active, same reasoning
+  // as addTab() itself: a template pick shouldn't require discarding
+  // unrelated in-progress work. addTab() already applies the usual
+  // _tabSwitchBlocked guard (no-op while a review/Antidote round-trip is
+  // pending), and onTextEdited() drives the same compile/session-save path
+  // a real keystroke would.
+  function insertTemplate(command) {
+    root.addTab()
+    root.onTextEdited(command)
+    root.tab = "editor"
+  }
+
   function openDocument(path) {
     editorTabItem.clearUndoHistory()
     root.suppressDocLoad = false
@@ -1996,6 +2009,9 @@ Item {
             uiFont: root.uiFont
             onAutosaveEnabledSet: function(enabled) { root.setAutosaveEnabled(enabled) }
             onAutosaveMinutesSet: function(minutes) { root.setAutosaveMinutes(minutes) }
+            onTypstUniverseOpenRequested: root.openWebapp(root.typstUniverseUrl)
+            onTemplateLinkOpenRequested: function(url) { root.openWebapp(url) }
+            onTemplateInsertRequested: function(command) { root.insertTemplate(command) }
           }
         }
 
