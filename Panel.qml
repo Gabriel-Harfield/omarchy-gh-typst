@@ -112,7 +112,6 @@ Item {
   readonly property string homeDir: Quickshell.env("HOME")
   readonly property string pluginDir: homeDir + "/.config/omarchy/plugins/io.github.gabrielharfield.ghtypst"
   readonly property string stateDir: homeDir + "/.local/state/omarchy/plugins/io.github.gabrielharfield.ghtypst"
-  readonly property string sessionPath: stateDir + "/session.json"
   readonly property string reviewsDir: stateDir + "/reviews"
   // Fixed, reused scratch files (not timestamped like reviewsDir) — this
   // is a high-frequency, single-flight operation with nothing to keep
@@ -147,18 +146,20 @@ Item {
   property string docPath: ""   // "" = untitled/new
   property string docText: ""
   property bool dirty: false
-  property bool sessionLoaded: false
   property bool suppressDocLoad: false
-  // Set while a session restore is in flight, so docFile's onLoaded/
-  // onLoadFailed know to reconcile against the persisted buffer instead
-  // of doing a plain "adopt whatever's on disk" open.
+  // Set while switching to an already-open tab (_loadTabIntoActive()), so
+  // docFile's onLoaded/onLoadFailed know to reconcile against that tab's
+  // cached buffer instead of doing a plain "adopt whatever's on disk"
+  // open. NOT used for restoring across a restart anymore — see this
+  // file's "no session persistence, by design" comment further down for
+  // why that was removed entirely.
   property bool pendingRestore: false
   property string pendingRestoreBuffer: ""
-  // Whether the persisted buffer was actually dirty (real unsaved edits)
-  // when the session was last written — see docFile.onLoaded's own
-  // comment for why this matters: a clean buffer must never be allowed
-  // to override newer disk content just because it happens to differ
-  // from whatever's on disk now.
+  // Whether that tab's own buffer was actually dirty (real unsaved
+  // edits) when it was last snapshotted away — see docFile.onLoaded's own
+  // comment for why this matters: a clean buffer must never be allowed to
+  // override newer disk content just because it happens to differ from
+  // whatever's on disk now.
   property bool pendingRestoreWasDirty: false
 
   readonly property string docDir: root.docPath ? root.docPath.slice(0, root.docPath.lastIndexOf("/")) : ""
@@ -334,9 +335,9 @@ Item {
   // per-tab parallel Process/FileView pipelines, reusing this file's own
   // hard-won lesson (see the compile-pipeline history above) that
   // overlapping instances of those sharing singleton state is a real bug
-  // class here, not a theoretical one. Session persistence (session.json)
-  // still only remembers the single active document across a restart, same
-  // as before this feature — the other open tabs are not yet durable.
+  // class here, not a theoretical one. No tab (active or otherwise)
+  // survives a restart — see this file's "no session persistence, by
+  // design" comment further down.
   //
   // root.docPath/docText/dirty/notesText/rightPaneView stay exactly what
   // they always were: the ONE active document's live state, read/written
@@ -394,13 +395,14 @@ Item {
   }
 
   // Loads a tabs[] entry into the live "current document" surface. Reuses
-  // docFile's existing pendingRestore reconciliation (the same mechanism
-  // session-restore already relies on) for a real path with cached
-  // in-memory content — if the cached text differs from what's actually on
-  // disk, the cache wins and dirty is set, exactly like restoring an
-  // unsaved edit after a shell restart. A tab that's never been loaded yet
-  // (freshly opened into a brand-new tab via "+") does a plain disk load
-  // instead, same as an ordinary openDocument().
+  // docFile's existing pendingRestore reconciliation for a real path with
+  // cached in-memory content — if that tab was genuinely dirty (real
+  // unsaved edits) when last switched away from, the cache wins and dirty
+  // is set; a clean tab always defers to whatever's actually on disk (see
+  // docFile.onLoaded's own comment for why that distinction matters). A
+  // tab that's never been loaded yet (freshly opened into a brand-new tab
+  // via "+") does a plain disk load instead, same as an ordinary
+  // openDocument().
   function _loadTabIntoActive(tab) {
     root.activeDocId = tab.id
     root.rightPaneView = tab.rightPaneView || "apercu"
@@ -503,7 +505,6 @@ Item {
     // doesn't even pay for the scratch-file write while the preview is
     // off, not just the typst process.
     if (root.previewEnabled) compileDebounce.restart()
-    root.scheduleSessionSave()
   }
 
   function newDocument() {
@@ -514,7 +515,6 @@ Item {
     root.previewVersion = 0
     root.previewPageCount = 0
     editorTabItem.clearUndoHistory()
-    root.scheduleSessionSave()
   }
 
   // Typst Universe template picker (Paramètres tab) — opens in a brand-new
@@ -522,8 +522,8 @@ Item {
   // as addTab() itself: a template pick shouldn't require discarding
   // unrelated in-progress work. addTab() already applies the usual
   // _tabSwitchBlocked guard (no-op while a review/Antidote round-trip is
-  // pending), and onTextEdited() drives the same compile/session-save path
-  // a real keystroke would.
+  // pending), and onTextEdited() drives the same compile path a real
+  // keystroke would.
   function insertTemplate(command) {
     root.addTab()
     root.onTextEdited(command)
@@ -534,10 +534,10 @@ Item {
     editorTabItem.clearUndoHistory()
     root.suppressDocLoad = false
     // Defensive reset: a stale true here (left over from an interrupted
-    // session-restore) would make docFile.onLoaded treat this fresh open
-    // as a restore-reconciliation instead of a plain load, silently
-    // discarding the newly-opened file's content in favor of whatever the
-    // old pendingRestoreBuffer held.
+    // tab switch, see _loadTabIntoActive()) would make docFile.onLoaded
+    // treat this fresh open as a restore-reconciliation instead of a
+    // plain load, silently discarding the newly-opened file's content in
+    // favor of whatever old pendingRestoreBuffer held.
     root.pendingRestore = false
     if (path === root.docPath) {
       // Same file already open — docPath won't change, so the FileView's
@@ -546,7 +546,6 @@ Item {
       return
     }
     root.docPath = path
-    root.scheduleSessionSave()
   }
 
   function saveDocument() {
@@ -575,7 +574,6 @@ Item {
     if (normalized === root.docPath) { docFile.setText(root.docText); return }
     root.suppressDocLoad = true
     root.docPath = normalized
-    root.scheduleSessionSave()
   }
 
   // --- typed-path bar (Ouvrir / Enregistrer sous… / destination PDF) ----
@@ -635,19 +633,23 @@ Item {
       if (root.pendingRestore) {
         root.pendingRestore = false
         var diskText = docFile.text()
-        // Only trust the persisted buffer over what's actually on disk
-        // if it was genuinely DIRTY (real unsaved edits) when the
-        // session was last written — never just because it happens to
-        // differ from disk. Real bug, reported by Gabriel 2026-08-30:
-        // editing the same Dropbox-synced document from a second
-        // machine (Harfield X13) between two sessions on this one
-        // (Ostrog) made a merely-stale-but-clean buffer here look
-        // "different from disk" and silently overwrite the newer
-        // content from the other machine once autosave fired. A clean
-        // buffer is just a mirror of whatever was on disk when this
-        // machine last touched the file — it has nothing worth
-        // protecting, so disk always wins when pendingRestoreWasDirty
-        // is false.
+        // Only trust the OTHER tab's cached buffer over what's actually
+        // on disk if it was genuinely DIRTY (real unsaved edits) when
+        // that tab was last snapshotted away — never just because it
+        // happens to differ from disk. This same comparison used to also
+        // run for restoring the last-open document across a shell
+        // restart, and THAT was a real, serious bug (reported by Gabriel
+        // 2026-08-30: editing the same Dropbox-synced document from a
+        // second machine — Harfield X13 — between two sessions on this
+        // one — Ostrog — made a merely-stale-but-clean buffer look
+        // "different from disk" and silently overwrite newer content
+        // from the other machine once autosave fired). That whole
+        // restore-on-launch feature was removed entirely as the actual
+        // fix (see "no session persistence, by design" below) — this
+        // `pendingRestore` mechanism now only ever fires for same-
+        // session, same-machine tab switches, where the equivalent risk
+        // doesn't exist, but the same "don't trust a clean buffer over
+        // disk" discipline is still correct here too.
         if (root.pendingRestoreWasDirty && root.pendingRestoreBuffer !== diskText) {
           root.docText = root.pendingRestoreBuffer
           root.dirty = true
@@ -680,11 +682,12 @@ Item {
       // though the save itself had actually succeeded.
       if (root.suppressDocLoad) { root.suppressDocLoad = false; Qt.callLater(function() { docFile.setText(root.docText) }); return }
       if (root.pendingRestore) {
-        // The file that was open last session is gone/unreadable now —
-        // fall back to whatever buffer was persisted, if any. Still
-        // gated on pendingRestoreWasDirty for the same reason as
-        // onLoaded above: a clean persisted buffer is nothing more than
-        // a stale mirror, not real unsaved work worth flagging dirty.
+        // The tab being switched to points at a file that's gone/
+        // unreadable now — fall back to whatever buffer was cached for
+        // it, if any. Still gated on pendingRestoreWasDirty for the same
+        // reason as onLoaded above: a clean cached buffer is nothing
+        // more than a stale mirror, not real unsaved work worth flagging
+        // dirty.
         root.pendingRestore = false
         root.docText = root.pendingRestoreBuffer
         root.dirty = root.pendingRestoreWasDirty
@@ -703,73 +706,34 @@ Item {
       // this actual write has happened), so the new file never appeared
       // in the tree yet. This fires once the write is actually done.
       if (!root.fileTreeUserNavigated) root.refreshFileTree(root.docDir)
-      // Flush session.json's dirty flag to false immediately rather than
-      // waiting on the usual 400ms debounce — closes a real race where
-      // saving right before shutting the machine down could leave a
-      // stale "dirty: true" behind, which is exactly what would make a
-      // future restore wrongly prefer this now-clean buffer over newer
-      // disk content from another machine. See docFile.onLoaded's own
-      // comment for the full story (Gabriel's cross-machine bug report,
-      // 2026-08-30).
-      if (root.sessionLoaded) {
-        sessionSaveDebounce.stop()
-        root._writeSessionNow()
-      }
     }
   }
 
-  // --- session persistence -----------------------------------------------
+  // --- no session persistence, by design ----------------------------------
   //
-  // Persists the buffer itself, not just which file was open — a plugin
-  // reload (a shell restart, routine while this plugin is under active
-  // development) must not destroy unsaved work, above all for an untitled
-  // document that has nowhere else to live.
-
-  FileView {
-    id: sessionFile
-    path: root.sessionPath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadSession(sessionFile.text())
-    onLoadFailed: root.loadSession("")
-  }
-
-  // Persists dirty alongside the buffer/path — see docFile.onLoaded's own
-  // comment for why: only a genuinely-dirty session is worth restoring
-  // over disk on the next open.
-  function _writeSessionNow() {
-    sessionFile.setText(Store.serializeSession({ lastDocPath: root.docPath, bufferText: root.docText, dirty: root.dirty }))
-  }
-
-  Timer {
-    id: sessionSaveDebounce
-    interval: 400
-    repeat: false
-    onTriggered: root._writeSessionNow()
-  }
-
-  function scheduleSessionSave() {
-    if (root.sessionLoaded) sessionSaveDebounce.restart()
-  }
-
-  function loadSession(text) {
-    var parsed = Store.parseSession(text)
-    root.sessionLoaded = true
-    if (parsed.lastDocPath) {
-      root.pendingRestoreBuffer = parsed.bufferText
-      root.pendingRestoreWasDirty = parsed.dirty
-      root.pendingRestore = true
-      root.docPath = parsed.lastDocPath // triggers docFile's path binding -> async load, reconciled above
-    } else if (parsed.bufferText) {
-      // Untitled document with unsaved content — nothing to load from
-      // disk at all (docFile's path never changes from "", so it never
-      // fires loaded/loadFailed for this case).
-      root.docText = parsed.bufferText
-      root.dirty = true
-      compileDebounce.restart()
-    }
-  }
+  // GH Typst used to remember the last-open document (path + buffer)
+  // across a restart, to protect an untitled/unsaved buffer from being
+  // destroyed by a routine `omarchy-restart-shell` during development.
+  // REMOVED 2026-08-30, Gabriel's own explicit, direct instruction after a
+  // real data-loss incident: editing the same Dropbox-synced document from
+  // two machines (Ostrog/Harfield X13) let a stale remembered buffer from
+  // one machine silently overwrite newer saved content from the other via
+  // autosave, once this plugin's `keepLoaded` auto-restore reopened it.
+  // A dirty-flag-gated fix was tried first and explained to him, but he
+  // found it too hard to reason about and confirm safe given real-world
+  // sync-timing risk (Dropbox can lag behind by seconds to minutes,
+  // especially reconnecting after being offline) — his own words: "il ne
+  // devrait y avoir aucune mémoire du dernier document. Quand on ferme
+  // l'appli, elle oublie. Quand on l'ouvre, on est sur un document vide."
+  // GH Typst now ALWAYS starts on a blank, untitled document — no
+  // `session.json`, no restore-on-launch code path at all. The
+  // `pendingRestore`/`pendingRestoreBuffer`/`pendingRestoreWasDirty`
+  // properties and the reconciliation logic in docFile.onLoaded/
+  // onLoadFailed above are NOT removed — `_loadTabIntoActive()` (switching
+  // between tabs already open in the SAME running session) still needs
+  // them, and that use is safe: it's same-machine, same-session, never
+  // exposed to the cross-restart/cross-machine staleness this bug was
+  // actually about.
 
   Process {
     id: ensureDirsProc
@@ -778,7 +742,6 @@ Item {
 
   Component.onCompleted: {
     ensureDirsProc.running = true
-    Qt.callLater(function() { sessionFile.reload() })
     Qt.callLater(function() { settingsFile.reload() })
     Qt.callLater(function() { root.refreshFileTree(root.fileTreeHomeDir()) })
   }
@@ -1120,7 +1083,6 @@ Item {
     root.dirty = true
     root.antidoteHasPreview = false
     compileDebounce.restart()
-    root.scheduleSessionSave()
   }
 
   // --- local system spellcheck (Éditeur tab) -----------------------------
@@ -1599,8 +1561,10 @@ Item {
   }
 
   // Only writes to disk when there's actually a path — an untitled
-  // document has nowhere to auto-save *to* and is already covered
-  // continuously by session persistence above, independent of this timer.
+  // document has nowhere to auto-save *to*. Since session persistence was
+  // removed (see "no session persistence, by design" above), an untitled
+  // document's content does NOT survive a shell restart at all anymore —
+  // a deliberate, accepted trade-off, not an oversight.
   Timer {
     id: autosaveTimer
     interval: root.autosaveMinutes * 60000
