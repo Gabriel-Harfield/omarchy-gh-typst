@@ -1384,7 +1384,7 @@ Item {
             // calendrier prend beaucoup trop de place en plein écran").
             // Only shrinks below the cap on a genuinely narrow pane, never
             // grows past it.
-            readonly property real cellSize: Math.min(Style.space(36), (width - Style.space(2) * 6) / 7)
+            readonly property real cellSize: Math.min(Style.space(42), (width - Style.space(2) * 6) / 7)
 
             Row {
               width: parent.width
