@@ -154,6 +154,12 @@ Item {
   // of doing a plain "adopt whatever's on disk" open.
   property bool pendingRestore: false
   property string pendingRestoreBuffer: ""
+  // Whether the persisted buffer was actually dirty (real unsaved edits)
+  // when the session was last written — see docFile.onLoaded's own
+  // comment for why this matters: a clean buffer must never be allowed
+  // to override newer disk content just because it happens to differ
+  // from whatever's on disk now.
+  property bool pendingRestoreWasDirty: false
 
   readonly property string docDir: root.docPath ? root.docPath.slice(0, root.docPath.lastIndexOf("/")) : ""
   // Compile scratch files land next to the real document (so relative
@@ -423,6 +429,10 @@ Item {
     }
     if (tab.loaded) {
       root.pendingRestoreBuffer = tab.text
+      // Same dirty-gated reconciliation as session restore (see
+      // docFile.onLoaded's own comment) — this tab's own snapshotted
+      // dirty flag, not left over from whatever the property last held.
+      root.pendingRestoreWasDirty = tab.dirty
       root.pendingRestore = true
     } else {
       root.pendingRestore = false
@@ -625,11 +635,20 @@ Item {
       if (root.pendingRestore) {
         root.pendingRestore = false
         var diskText = docFile.text()
-        // A persisted buffer that differs from what's actually on disk
-        // means there were unsaved edits when the last session was
-        // written — restore those rather than silently discarding them
-        // in favor of the (older) saved file.
-        if (root.pendingRestoreBuffer !== diskText) {
+        // Only trust the persisted buffer over what's actually on disk
+        // if it was genuinely DIRTY (real unsaved edits) when the
+        // session was last written — never just because it happens to
+        // differ from disk. Real bug, reported by Gabriel 2026-08-30:
+        // editing the same Dropbox-synced document from a second
+        // machine (Harfield X13) between two sessions on this one
+        // (Ostrog) made a merely-stale-but-clean buffer here look
+        // "different from disk" and silently overwrite the newer
+        // content from the other machine once autosave fired. A clean
+        // buffer is just a mirror of whatever was on disk when this
+        // machine last touched the file — it has nothing worth
+        // protecting, so disk always wins when pendingRestoreWasDirty
+        // is false.
+        if (root.pendingRestoreWasDirty && root.pendingRestoreBuffer !== diskText) {
           root.docText = root.pendingRestoreBuffer
           root.dirty = true
         } else {
@@ -662,10 +681,13 @@ Item {
       if (root.suppressDocLoad) { root.suppressDocLoad = false; Qt.callLater(function() { docFile.setText(root.docText) }); return }
       if (root.pendingRestore) {
         // The file that was open last session is gone/unreadable now —
-        // fall back to whatever buffer was persisted, if any.
+        // fall back to whatever buffer was persisted, if any. Still
+        // gated on pendingRestoreWasDirty for the same reason as
+        // onLoaded above: a clean persisted buffer is nothing more than
+        // a stale mirror, not real unsaved work worth flagging dirty.
         root.pendingRestore = false
         root.docText = root.pendingRestoreBuffer
-        root.dirty = root.pendingRestoreBuffer !== ""
+        root.dirty = root.pendingRestoreWasDirty
         compileDebounce.restart()
         return
       }
@@ -681,6 +703,18 @@ Item {
       // this actual write has happened), so the new file never appeared
       // in the tree yet. This fires once the write is actually done.
       if (!root.fileTreeUserNavigated) root.refreshFileTree(root.docDir)
+      // Flush session.json's dirty flag to false immediately rather than
+      // waiting on the usual 400ms debounce — closes a real race where
+      // saving right before shutting the machine down could leave a
+      // stale "dirty: true" behind, which is exactly what would make a
+      // future restore wrongly prefer this now-clean buffer over newer
+      // disk content from another machine. See docFile.onLoaded's own
+      // comment for the full story (Gabriel's cross-machine bug report,
+      // 2026-08-30).
+      if (root.sessionLoaded) {
+        sessionSaveDebounce.stop()
+        root._writeSessionNow()
+      }
     }
   }
 
@@ -701,11 +735,18 @@ Item {
     onLoadFailed: root.loadSession("")
   }
 
+  // Persists dirty alongside the buffer/path — see docFile.onLoaded's own
+  // comment for why: only a genuinely-dirty session is worth restoring
+  // over disk on the next open.
+  function _writeSessionNow() {
+    sessionFile.setText(Store.serializeSession({ lastDocPath: root.docPath, bufferText: root.docText, dirty: root.dirty }))
+  }
+
   Timer {
     id: sessionSaveDebounce
     interval: 400
     repeat: false
-    onTriggered: sessionFile.setText(Store.serializeSession({ lastDocPath: root.docPath, bufferText: root.docText }))
+    onTriggered: root._writeSessionNow()
   }
 
   function scheduleSessionSave() {
@@ -717,6 +758,7 @@ Item {
     root.sessionLoaded = true
     if (parsed.lastDocPath) {
       root.pendingRestoreBuffer = parsed.bufferText
+      root.pendingRestoreWasDirty = parsed.dirty
       root.pendingRestore = true
       root.docPath = parsed.lastDocPath // triggers docFile's path binding -> async load, reconciled above
     } else if (parsed.bufferText) {
