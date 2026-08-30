@@ -1703,6 +1703,7 @@ Item {
               spacing: Style.space(6)
 
               Button {
+                iconText: ""
                 text: "Éditeur"
                 selected: root.tab === "editor"
                 foreground: root.fg
@@ -1710,7 +1711,7 @@ Item {
                 onClicked: root.tab = "editor"
               }
               Button {
-                iconText: "󰚩"
+                iconText: ""
                 text: "Révision"
                 selected: root.tab === "revision"
                 foreground: root.fg
@@ -1718,6 +1719,7 @@ Item {
                 onClicked: root.tab = "revision"
               }
               Button {
+                iconText: ""
                 text: "Paramètres"
                 selected: root.tab === "settings"
                 foreground: root.fg
