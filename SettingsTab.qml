@@ -204,7 +204,7 @@ Item {
             width: parent.width
             leftAlign: true
             iconText: ""
-            text: "Insérer dans un nouveau document"
+            text: "Nouveau document"
             bordered: true
             foreground: root.foreground
             accent: root.accentColor
