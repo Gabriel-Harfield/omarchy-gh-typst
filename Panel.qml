@@ -208,7 +208,7 @@ Item {
     var base = (dot > slash) ? root.docPath.slice(0, dot) : root.docPath
     return base + ".notes.md"
   }
-  property string rightPaneView: "apercu" // "apercu" | "notes"
+  property string rightPaneView: "apercu" // "apercu" | "notes" | "journal"
   property string notesText: ""
 
   FileView {
@@ -231,6 +231,381 @@ Item {
   function onNotesEdited(newText) {
     root.notesText = newText
     if (root.docPath) notesSaveDebounce.restart()
+  }
+
+  // --- MultiDoc / Projet (left-panel "Projet" view) -----------------------
+  //
+  // Gabriel's idea, 2026-09-02, second round — an Ulysses-style workflow:
+  // "Projet" (a third left-panel mode alongside Fichiers/Titres, see
+  // leftPanelMode below and EditorTab.qml's own header-row buttons) holds
+  // a staging list of other .typ files that get woven into THIS document's
+  // compile output as generated #include lines — injected only into the
+  // two shadow compile files this plugin already maintains for preview/PDF
+  // export (previewSrcFile/pdfExportSrcFile further down and
+  // startPdfExport()), never into docText itself. Back to this design
+  // after briefly trying the opposite (auto-inserting real #include text
+  // into docText) — Gabriel confirmed invisible/auto-synced is what he
+  // actually wants for this workflow: the staging list drives the compiled
+  // "manuscript" the way Ulysses' sheet list does, and free-form editing
+  // of the actual .typ files happens by switching between the file-tree
+  // entries, not by hand-managing #include lines. That does mean typst's
+  // reported error line numbers land in the SHADOW file, offset by however
+  // many prelude lines were prepended — compileProc.onExited corrects for
+  // that before anything reaches jumpToError (see its own comment there).
+  //
+  // The staging list is persisted the same way notes are: a plain sidecar
+  // next to the document, "<doc>.multidoc.json", entirely disk-driven
+  // (multidocPaths is NOT cached in tabs[], same as notesText already
+  // isn't — see _loadTabIntoActive's own comment on why: the sidecar
+  // FileView's path is derived from docPath, so it reloads on its own the
+  // instant docPath changes on a tab switch).
+  readonly property string multidocPath: {
+    if (!root.docPath) return ""
+    var dot = root.docPath.lastIndexOf(".")
+    var slash = root.docPath.lastIndexOf("/")
+    var base = (dot > slash) ? root.docPath.slice(0, dot) : root.docPath
+    return base + ".multidoc.json"
+  }
+  readonly property bool multidocAvailable: root.docPath !== ""
+  property var multidocPaths: []
+
+  FileView {
+    id: multidocListFile
+    path: root.multidocPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      var parsed = null
+      try { parsed = JSON.parse(multidocListFile.text() || "[]") } catch (e) { parsed = null }
+      root.multidocPaths = (parsed instanceof Array) ? parsed : []
+    }
+    onLoadFailed: root.multidocPaths = [] // no MultiDoc list for this document yet — not an error
+  }
+
+  Timer {
+    id: multidocSaveDebounce
+    interval: 500
+    repeat: false
+    onTriggered: if (root.docPath) multidocListFile.setText(JSON.stringify(root.multidocPaths))
+  }
+
+  // Every mutator below reassigns root.multidocPaths to a brand-new array
+  // rather than mutating in place — required for the property-change
+  // notification EditorTab.qml's Repeater relies on to redraw the list at
+  // all (see EditorTab.qml's own comment on its MultiDoc row delegate for
+  // why that's also fine UX-wise despite rebuilding every row).
+  function multidocAdd() {
+    if (!root.multidocAvailable) return
+    root.multidocPaths = root.multidocPaths.concat([""])
+    multidocSaveDebounce.restart()
+  }
+
+  function multidocRemove(index) {
+    if (index < 0 || index >= root.multidocPaths.length) return
+    var next = root.multidocPaths.slice()
+    next.splice(index, 1)
+    root.multidocPaths = next
+    multidocSaveDebounce.restart()
+  }
+
+  function multidocPathEdited(index, newPath) {
+    if (index < 0 || index >= root.multidocPaths.length) return
+    var next = root.multidocPaths.slice()
+    next[index] = newPath.trim()
+    root.multidocPaths = next
+    multidocSaveDebounce.restart()
+  }
+
+  // The Projet panel's row "eye" button (Gabriel's ask, 2026-09-02) —
+  // opens that staged file in a fresh tab so he can look at/edit it
+  // directly, same addTab()-then-load sequencing insertTemplate() already
+  // uses elsewhere in this file.
+  // Also used directly by the Projet panel's maître.typ/lib.typ head
+  // buttons below, not just the per-row eye button.
+  function openPathInNewTab(path) {
+    if (!path || root._tabSwitchBlocked) return
+    root.addTab()
+    root.openDocument(path)
+  }
+
+  function multidocOpenInNewTab(index) {
+    if (index < 0 || index >= root.multidocPaths.length) return
+    var p = root.multidocPaths[index]
+    if (!p || p.charAt(0) !== "/") return
+    root.openPathInNewTab(p)
+  }
+
+  // Row display, Gabriel's ask 2026-09-02: a committed row shows just the
+  // filename (matching tabTitle()'s own fileBaseName() convention
+  // elsewhere in this file), not the full absolute path — friendlier to
+  // scan once a project has more than a couple of chapters. An empty or
+  // malformed row (no leading "/") is left as-is so the placeholder text
+  // still shows through.
+  function multidocDisplayName(path) {
+    if (!path || path.charAt(0) !== "/") return path || ""
+    return root.fileBaseName(path)
+  }
+
+  function multidocReordered(fromIndex, toIndex) {
+    if (fromIndex === toIndex) return
+    if (fromIndex < 0 || fromIndex >= root.multidocPaths.length) return
+    if (toIndex < 0 || toIndex >= root.multidocPaths.length) return
+    var next = root.multidocPaths.slice()
+    var moved = next.splice(fromIndex, 1)[0]
+    next.splice(toIndex, 0, moved)
+    root.multidocPaths = next
+    multidocSaveDebounce.restart()
+  }
+
+  // Lowest common ancestor of two absolute directory paths (no trailing
+  // slash on either, except the root "/" itself) — used below to compute
+  // how far the typst --root needs to widen to cover every MultiDoc entry.
+  function _commonAncestorDir(a, b) {
+    var as = a.split("/")
+    var bs = b.split("/")
+    var out = []
+    for (var i = 0; i < as.length && i < bs.length; i++) {
+      if (as[i] !== bs[i]) break
+      out.push(as[i])
+    }
+    var result = out.join("/")
+    return result === "" ? "/" : result
+  }
+
+  // typst resolves a relative #include path against the FILE that contains
+  // it, not against --root — --root only gates which files are reachable
+  // at all. So the generated #include lines stay relative to docDir (exactly
+  // like a hand-written one would be), and only the compiler's --root needs
+  // widening to cover paths outside docDir. See _multidocEffectiveRoot().
+  function _relativePath(fromDir, toPath) {
+    var fromParts = fromDir.split("/").filter(function(s) { return s !== "" })
+    var toParts = toPath.split("/").filter(function(s) { return s !== "" })
+    var i = 0
+    while (i < fromParts.length && i < toParts.length && fromParts[i] === toParts[i]) i++
+    var ups = fromParts.length - i
+    var segs = []
+    for (var k = 0; k < ups; k++) segs.push("..")
+    return segs.concat(toParts.slice(i)).join("/")
+  }
+
+  // The --root actually passed to `typst compile` for both the live
+  // preview and PDF export — widened to cover every valid MultiDoc entry
+  // when there are any, otherwise identical to the old always-docDir
+  // behavior (previewDir), so a document with no MultiDoc list compiles
+  // exactly as before this feature existed.
+  function _multidocEffectiveRoot() {
+    var base = root.previewDir
+    if (!base) return base
+    var validPaths = (root.multidocPaths || []).filter(function(p) { return p && p.charAt(0) === "/" })
+    var ancestor = base
+    for (var i = 0; i < validPaths.length; i++) {
+      var dir = validPaths[i].slice(0, validPaths[i].lastIndexOf("/"))
+      ancestor = root._commonAncestorDir(ancestor, dir === "" ? "/" : dir)
+    }
+    return ancestor
+  }
+
+  function _multidocIncludeLines() {
+    if (!root.docDir) return []
+    var out = []
+    for (var i = 0; i < (root.multidocPaths || []).length; i++) {
+      var p = root.multidocPaths[i]
+      if (!p || p.charAt(0) !== "/") continue
+      out.push('#include "' + root._relativePath(root.docDir, p).replace(/"/g, '\\"') + '"')
+    }
+    return out
+  }
+
+  // Marked so a curious `cat` of the shadow file (or a stray look at
+  // pdfExportSrcPath) reads as obviously generated, not hand-written.
+  readonly property string _multidocMarkerBegin: "// --- MultiDoc : inclusions générées, ne pas modifier ici ---"
+  readonly property string _multidocMarkerEnd: "// --- fin MultiDoc ---"
+
+  // Appended AFTER docText (not prepended before it) — Gabriel's bug
+  // report, 2026-09-02: with the includes placed first, any config
+  // maître.typ itself sets up (`#show: conf.with(...)`, in his real case)
+  // only takes effect on content that comes AFTER it in the document, so
+  // everything pulled in by MultiDoc was rendering under Typst's plain
+  // defaults — no header/footer, no indent, numbered-text misplaced.
+  // Appending instead means docText's own imports/show/set rules always
+  // run first, then the staged files render under whatever configuration
+  // maître.typ already established, exactly like maître.typ acting as a
+  // shell that hands off to its chapters. Leading "\n" is defensive: keeps
+  // the marker on its own line even if docText doesn't end in one.
+  function _multidocAppendix() {
+    var lines = root._multidocIncludeLines()
+    if (lines.length === 0) return ""
+    return "\n" + root._multidocMarkerBegin + "\n" + lines.join("\n") + "\n" + root._multidocMarkerEnd + "\n"
+  }
+
+  // Number of lines docText itself occupies at the front of the shadow
+  // file — any compiler diagnostic landing beyond this line is inside the
+  // appended MultiDoc block (or an included file), not in docText, so it
+  // has no real-document line to point jumpToError() at (see
+  // compileProc.onExited).
+  function _docTextLineCount() {
+    return root.docText === "" ? 0 : root.docText.split("\n").length
+  }
+
+  // --- Projet: "Créer un nouveau projet" scaffold -------------------------
+  //
+  // Gabriel's ask, 2026-09-02: a one-click starting point matching his own
+  // teaching-document convention — a folder holding a maître.typ (imports
+  // conf from lib.typ, right next to it, and applies it) and a lib.typ
+  // (conf/indented/numbered-text, literal text he gave me verbatim). No
+  // @local package involved at all — his first version of maître.typ tried
+  // that and it broke: the package only ever existed inside Typesetter's
+  // Flatpak sandbox, invisible to the system typst GH Typst calls, and
+  // even once the import path itself was fixed, an #include'd chapter
+  // still can't see identifiers the master document imported (Typst gives
+  // each included file its own scope) — importing from a plain sibling
+  // lib.typ sidesteps both problems by keeping everything local to the
+  // project folder. maître.typ only imports `conf`: indented/numbered-text
+  // only ever affect the specific body they're called on, so they belong
+  // at whatever call site actually needs them (typically wrapping one
+  // particular #include), not the default scaffold. Sequenced through
+  // three Process/FileView steps (check → mkdir → write master → write
+  // lib) because each depends on the previous one actually having
+  // succeeded — see createNewProject() below for the guard against
+  // silently overwriting an existing project.
+  property string _pendingNewProjectDir: ""
+  property string newProjectError: ""
+  readonly property string _newProjectMasterPath: root._pendingNewProjectDir ? (root._pendingNewProjectDir + "/maître.typ") : ""
+  readonly property string _newProjectLibPath: root._pendingNewProjectDir ? (root._pendingNewProjectDir + "/lib.typ") : ""
+
+  // Imports lib.typ directly (not the @local/modele-general package) —
+  // Gabriel's own correction, 2026-09-02, after the package proved to
+  // only exist inside Typesetter's Flatpak sandbox, invisible to the
+  // system typst GH Typst calls. Only `conf` is imported here (not
+  // numbered-text/indented, his own second correction, same day): those
+  // two only ever affect the specific body they're called on, so they
+  // belong at the call site that actually needs them (typically wrapping
+  // one particular #include from the Projet panel's staging list), not in
+  // this default scaffold. titre/classe are literal values he gave
+  // directly, not placeholders — his own explicit content this time.
+  readonly property string _newProjectMasterTemplate: [
+    '#import "lib.typ": conf',
+    '#show: conf.with(',
+    '  titre: "Correction - Commentaire",',
+    '  classe: "1SCHA - 2026-2027",',
+    ')',
+    ''
+  ].join("\n")
+
+  readonly property string _newProjectLibTemplate: [
+    '#let conf(',
+    '  titre: "Intitulé du parcours",',
+    '  classe: "Classe - Année Scolaire",',
+    '  body,',
+    ') = {',
+    '  set page(',
+    '    paper: "a4",',
+    '    margin: 2.5cm,',
+    '    footer: context [',
+    '      #set align(left)',
+    '      #set text(10pt)',
+    '      #emph[M.Harfield - #classe]',
+    '      #h(1fr)',
+    '      #counter(page).display()',
+    '    ],',
+    '    header: context [',
+    '      #set align(right)',
+    '      #set text(11pt)',
+    '      *#titre*',
+    '    ],',
+    '  )',
+    '  set text(',
+    '    lang: "fr",',
+    '    size: 12pt,',
+    '  )',
+    '  set par(justify: true, leading: 1.15em)',
+    '  body',
+    '}',
+    '',
+    '#let indented(body) = {',
+    '  set par(first-line-indent: 1.5em)',
+    '  body',
+    '}',
+    '',
+    '#let line-offset = counter("line-offset")',
+    '#let numbered-text(n, step: 5, body) = [',
+    '  #show: doc => context {',
+    '    let prev = line-offset.get().first()',
+    '    set par.line(numbering: i => {',
+    '      let rel = i - prev',
+    '      if calc.rem(rel, step) == 0 or rel == 1 { rel }',
+    '    })',
+    '    doc',
+    '    line-offset.update(x => x + n)',
+    '  }',
+    '  #body',
+    ']',
+    ''
+  ].join("\n")
+
+  // Entry point (Projet panel's "Créer un nouveau projet" button, via the
+  // typed-path bar's "newProject" mode). Checks first rather than letting
+  // `mkdir -p` + an unconditional write silently clobber an existing
+  // maître.typ in a folder Gabriel already has a project in.
+  function createNewProject(path) {
+    var normalized = path.trim().replace(/\/+$/, "")
+    if (!normalized) return
+    root.newProjectError = ""
+    root._pendingNewProjectDir = normalized
+    newProjectCheckProc.command = ["test", "-e", normalized + "/maître.typ"]
+    newProjectCheckProc.running = false
+    newProjectCheckProc.running = true
+  }
+
+  Process {
+    id: newProjectCheckProc
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.newProjectError = "Un maître.typ existe déjà dans ce dossier — projet non créé."
+        root._pendingNewProjectDir = ""
+        return
+      }
+      newProjectMkdirProc.command = ["mkdir", "-p", root._pendingNewProjectDir]
+      newProjectMkdirProc.running = false
+      newProjectMkdirProc.running = true
+    }
+  }
+
+  Process {
+    id: newProjectMkdirProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0 || !root._pendingNewProjectDir) {
+        root.newProjectError = "Impossible de créer le dossier du projet."
+        root._pendingNewProjectDir = ""
+        return
+      }
+      newProjectMasterFile.setText(root._newProjectMasterTemplate)
+    }
+  }
+
+  FileView {
+    id: newProjectMasterFile
+    path: root._newProjectMasterPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onSaved: newProjectLibFile.setText(root._newProjectLibTemplate)
+  }
+
+  FileView {
+    id: newProjectLibFile
+    path: root._newProjectLibPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onSaved: {
+      var masterPath = root._newProjectMasterPath
+      var dir = root._pendingNewProjectDir
+      root._pendingNewProjectDir = ""
+      root.refreshFileTree(dir)
+      root.requestDiscardAndThen(function() { root.openDocument(masterPath) })
+    }
   }
 
   // --- journal (Aperçu/Notes/Journal right-pane view) ---------------------
@@ -409,6 +784,10 @@ Item {
     if (notesSaveDebounce.running) {
       notesSaveDebounce.stop()
       if (root.docPath) notesFile.setText(root.notesText)
+    }
+    if (multidocSaveDebounce.running) {
+      multidocSaveDebounce.stop()
+      if (root.docPath) multidocListFile.setText(JSON.stringify(root.multidocPaths))
     }
     root.tabs = root.tabs.map(function(t) {
       if (t.id !== root.activeDocId) return t
@@ -636,6 +1015,7 @@ Item {
     if (mode === "open") root.requestDiscardAndThen(function() { root.openDocument(path) })
     else if (mode === "saveAs") root.saveDocumentAs(path)
     else if (mode === "exportPdf") root.startPdfExport(path)
+    else if (mode === "newProject") root.createNewProject(path)
   }
 
   function cancelPathEntry() {
@@ -800,7 +1180,7 @@ Item {
 
   function startCompile() {
     if (root.docText === "") { root.compileErrors = []; return }
-    previewSrcFile.setText(root.docText)
+    previewSrcFile.setText(root.docText + root._multidocAppendix())
   }
 
   FileView {
@@ -811,7 +1191,7 @@ Item {
     printErrors: false
     onSaved: {
       root.compiling = true
-      compileProc.command = ["bash", root.pluginDir + "/compile.sh", root.previewSrcPath, root.previewDir, root.previewDir, root.previewPagePrefix]
+      compileProc.command = ["bash", root.pluginDir + "/compile.sh", root.previewSrcPath, root._multidocEffectiveRoot(), root.previewDir, root.previewPagePrefix]
       compileProc.running = false
       compileProc.running = true
     }
@@ -828,7 +1208,19 @@ Item {
         root.compileErrors = [{ line: 0, col: 0, severity: "error", message: "Erreur interne du script de compilation." }]
         return
       }
-      root.compileErrors = parsed.errors || []
+      // Diagnostics come back with line numbers into the shadow file
+      // (docText + appendix), not into docText alone — see startCompile()'s
+      // own _multidocAppendix() comment. docText's own lines are unshifted
+      // (the appendix comes after, not before), so no offset math is
+      // needed for a real docText line — only a clamp: anything beyond
+      // docText's own line count is inside the appended MultiDoc block (or
+      // an included file), with no real-document line to point at, so it's
+      // shown with line 0 (no jump) rather than a wrong one.
+      var maxLine = root._docTextLineCount()
+      root.compileErrors = (parsed.errors || []).map(function(e) {
+        if (e.line <= 0 || e.line <= maxLine) return e
+        return { line: 0, col: e.col, severity: e.severity, message: e.message }
+      })
       // On success, refresh the page count and bump the preview version
       // so every page Image's source string changes (filenames are
       // stable and overwritten in place each compile — the version query
@@ -1169,7 +1561,16 @@ Item {
     Component.onCompleted: running = true
   }
 
+  // TEMPORARY diagnostic switch, 2026-09-02 — Gabriel suspects local
+  // spellcheck (the hunspell detect pass + the misspelled-word overlay it
+  // feeds) is the remaining source of editor lag on his stress document,
+  // even after virtualizing the overlay's Repeater. Flip this back to
+  // false (or delete it) once the diagnostic test is done — it's the ONE
+  // thing gating requestSpellcheck() below, nothing else changed.
+  property bool _spellcheckDiagnosticDisabled: false
+
   function requestSpellcheck(text) {
+    if (root._spellcheckDiagnosticDisabled) return
     if (!root.spellcheckAvailable) return
     if (root._spellcheckBusy) {
       // Queue-on-busy, not a forced Process restart — confirmed the only
@@ -1330,12 +1731,31 @@ Item {
   // a path containing spaces or shell metacharacters is never
   // reinterpreted.
 
-  // "" | "files" | "headings" — the left panel is a single slot shared by
-  // the file tree and the heading outline, one at a time (Gabriel's
-  // explicit choice, 2026-08-29, over showing both stacked). Clicking the
-  // already-active one collapses the panel entirely, same as the old
-  // plain on/off showFileTree toggle this replaces.
+  // "files" | "headings" | "project" — the left panel is a single slot
+  // shared by the file tree, the heading outline, and Projet, one at a
+  // time (Gabriel's explicit choice, 2026-08-29, over showing both
+  // stacked; "project" added 2026-09-02). Always one of the three now,
+  // never "" — see leftPanelHidden below for why.
   property string leftPanelMode: "files"
+
+  // Whether the whole left-panel slot is collapsed — split out as its own
+  // flag, 2026-09-02, after Gabriel hit a real dead end: leftPanelMode
+  // used to double as "hidden" via "", but the toggle row itself was only
+  // visible while a mode was active, so collapsing it (clicking the
+  // already-active mode button) hid the ONE thing that could bring it
+  // back. Independent axis now, same relationship as EditorTab.qml's own
+  // rightPaneHidden/rightPaneView on the opposite side: which mode is
+  // selected and whether the panel is currently shown are orthogonal.
+  property bool leftPanelHidden: false
+
+  // The three mode buttons' click handler — selecting a mode also reveals
+  // the panel if it was hidden (same as clicking Aperçu/Notes/Journal on
+  // the right always implies "shown"); the dedicated toggle button further
+  // down is the only thing that hides it again.
+  function selectLeftPanelMode(mode) {
+    root.leftPanelMode = mode
+    root.leftPanelHidden = false
+  }
   property string fileTreeDir: ""
   property var fileTreeEntries: [] // [{name, isDir}]
   property bool fileTreeUserNavigated: false
@@ -1652,7 +2072,7 @@ Item {
     root.exportingPdf = true
     root.pdfExportError = ""
     root.pdfExportedPath = ""
-    pdfExportSrcFile.setText(root.docText)
+    pdfExportSrcFile.setText(root.docText + root._multidocAppendix())
   }
 
   FileView {
@@ -1662,7 +2082,7 @@ Item {
     atomicWrites: true
     printErrors: false
     onSaved: {
-      pdfExportProc.command = ["typst", "compile", "--root", root.previewDir, root.pdfExportSrcPath, root._pendingPdfPath]
+      pdfExportProc.command = ["typst", "compile", "--root", root._multidocEffectiveRoot(), root.pdfExportSrcPath, root._pendingPdfPath]
       pdfExportProc.running = false
       pdfExportProc.running = true
     }
@@ -1745,7 +2165,7 @@ Item {
         // ------------------------------------------------------- header
         Item {
           width: parent.width
-          height: Math.max(headerTitle.implicitHeight, toolbarRow.implicitHeight)
+          height: Math.max(headerTitle.implicitHeight, fileMenuButton.implicitHeight)
 
           Row {
             anchors.left: parent.left
@@ -1800,47 +2220,84 @@ Item {
             }
           }
 
-          Row {
-            id: toolbarRow
+          // Nouveau/Ouvrir/Enregistrer/Enregistrer sous/Export PDF,
+          // collapsed into one dropdown behind a plain hamburger icon
+          // (Gabriel's ask, 2026-09-02: five separate buttons crowded
+          // and wrapped awkwardly on a narrower or split screen). Popup
+          // (not the full Dropdown component from qs.Ui — that one's
+          // built for picking a persistent value, wrong shape for a
+          // list of one-shot actions) mirrors exactly how Dropdown.qml
+          // itself positions its own popup: nested inside the trigger
+          // Button, x/y relative to it, no explicit `parent:` needed —
+          // proven pattern already used elsewhere in this shell
+          // (RevisionTab.qml's two Dropdowns).
+          Button {
+            id: fileMenuButton
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(8)
+            iconText: ""
+            tooltipText: "Fichier"
+            selected: fileMenuPopup.opened
+            foreground: root.fg
+            accent: root.accentColor
+            onClicked: fileMenuPopup.opened ? fileMenuPopup.close() : fileMenuPopup.open()
 
-            Button {
-              iconText: ""
-              text: "Nouveau"
-              foreground: root.fg
-              accent: root.accentColor
-              onClicked: root.requestDiscardAndThen(root.newDocument)
-            }
-            Button {
-              iconText: ""
-              text: "Ouvrir"
-              foreground: root.fg
-              accent: root.accentColor
-              onClicked: root.beginPathEntry("open", root.docPath)
-            }
-            Button {
-              iconText: ""
-              text: "Enregistrer"
-              foreground: root.fg
-              accent: root.accentColor
-              onClicked: root.saveDocument()
-            }
-            Button {
-              iconText: ""
-              text: "Enregistrer sous…"
-              foreground: root.fg
-              accent: root.accentColor
-              onClicked: root.beginPathEntry("saveAs", root.docPath)
-            }
-            Button {
-              iconText: ""
-              text: root.exportingPdf ? "Export…" : "Export PDF"
-              foreground: root.fg
-              accent: root.accentColor
-              enabled: !root.exportingPdf && root.docText !== ""
-              onClicked: root.exportPdf()
+            Popup {
+              id: fileMenuPopup
+              y: fileMenuButton.height + Style.space(4)
+              x: fileMenuButton.width - width
+              width: Style.space(200)
+              padding: Style.space(6)
+              closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+              background: Rectangle {
+                color: Qt.darker(root.bg, 1.05)
+                border.color: root.faint
+                border.width: 1
+                radius: Style.cornerRadius
+              }
+
+              contentItem: Column {
+                width: fileMenuPopup.availableWidth
+                spacing: Style.space(2)
+
+                Button {
+                  width: parent.width
+                  text: "Nouveau"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: { fileMenuPopup.close(); root.requestDiscardAndThen(root.newDocument) }
+                }
+                Button {
+                  width: parent.width
+                  text: "Ouvrir"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: { fileMenuPopup.close(); root.beginPathEntry("open", root.docPath) }
+                }
+                Button {
+                  width: parent.width
+                  text: "Enregistrer"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: { fileMenuPopup.close(); root.saveDocument() }
+                }
+                Button {
+                  width: parent.width
+                  text: "Enregistrer sous…"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: { fileMenuPopup.close(); root.beginPathEntry("saveAs", root.docPath) }
+                }
+                Button {
+                  width: parent.width
+                  text: root.exportingPdf ? "Export…" : "Export PDF"
+                  enabled: !root.exportingPdf && root.docText !== ""
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: { fileMenuPopup.close(); root.exportPdf() }
+                }
+              }
             }
           }
         }
@@ -1865,6 +2322,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             text: root.pathBarMode === "open" ? "Chemin à ouvrir :"
               : root.pathBarMode === "saveAs" ? "Enregistrer sous :"
+              : root.pathBarMode === "newProject" ? "Nouveau projet (dossier) :"
               : "Exporter le PDF vers :"
             color: root.dim
             font.family: root.uiFont
@@ -1919,11 +2377,159 @@ Item {
             anchors.fill: parent
             visible: root.tab === "editor"
 
+            // Every tab/panel-visibility icon — both sides — on one
+            // shared row, full width, at the very top of editorBody
+            // (Gabriel's explicit correction, 2026-09-02, after two failed
+            // attempts: this is NOT split across editorHeader/
+            // previewHeaderRow anymore, and it does NOT live one level
+            // down inside either column — only "Éditeur" and its own
+            // lignes/marges/zoom controls sit below this row, on the
+            // editor's own header. Left cluster: leftPanelHidden toggle +
+            // Fichiers/Titres/Projet (collapse together). Right cluster:
+            // Aperçu/Notes/Journal + the previewEnabled eye + the
+            // rightPaneHidden toggle, in that exact order — Gabriel's ask
+            // that the pane-hide button sit immediately to the right of
+            // the eye button, not above it. Both hide/show toggles
+            // (leftPanelHideButton/rightPanelHideButton) stay put at the
+            // two far edges regardless of anything collapsing, so neither
+            // side can ever strand the user with no way back.
+            Item {
+              id: topIconRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              height: leftPanelHideButton.implicitHeight
+
+              Button {
+                id: leftPanelHideButton
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: root.leftPanelHidden ? "" : ""
+                selected: root.leftPanelHidden
+                tooltipText: root.leftPanelHidden
+                  ? "Réafficher le panneau"
+                  : "Masquer le panneau (l'éditeur prend toute la largeur)"
+                foreground: root.fg
+                accent: root.accentColor
+                onClicked: root.leftPanelHidden = !root.leftPanelHidden
+              }
+
+              Row {
+                visible: !root.leftPanelHidden
+                anchors.left: leftPanelHideButton.right
+                anchors.leftMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(4)
+
+                Button {
+                  iconText: ""
+                  tooltipText: "Fichiers"
+                  selected: root.leftPanelMode === "files"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.selectLeftPanelMode("files")
+                }
+                Button {
+                  iconText: ""
+                  tooltipText: "Titres du document"
+                  selected: root.leftPanelMode === "headings"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.selectLeftPanelMode("headings")
+                }
+                Button {
+                  iconText: ""
+                  tooltipText: "Projet"
+                  selected: root.leftPanelMode === "project"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.selectLeftPanelMode("project")
+                }
+              }
+
+              Button {
+                id: rightPanelHideButton
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: root.rightPaneHidden ? "" : ""
+                selected: root.rightPaneHidden
+                tooltipText: root.rightPaneHidden
+                  ? "Réafficher le panneau Aperçu/Notes"
+                  : "Masquer le panneau Aperçu/Notes (l'éditeur prend toute la largeur)"
+                foreground: root.fg
+                accent: root.accentColor
+                onClicked: root.setRightPaneHidden(!root.rightPaneHidden)
+              }
+
+              Row {
+                visible: !root.rightPaneHidden
+                anchors.right: rightPanelHideButton.left
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(8)
+
+                // Aperçu/Notes: which content the right pane shows — not
+                // the same axis as the eye icon further right, which is
+                // whether Typst compilation even runs at all (Gabriel's
+                // explicit split, 2026-08-29): you can be looking at Notes
+                // while the preview keeps compiling in the background, or
+                // looking at Aperçu with compilation paused on a large
+                // document.
+                Button {
+                  text: "Aperçu"
+                  selected: root.rightPaneView === "apercu"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.rightPaneView = "apercu"
+                }
+                Button {
+                  text: "Notes"
+                  selected: root.rightPaneView === "notes"
+                  enabled: root.docPath !== ""
+                  tooltipText: root.docPath !== "" ? "" : "Enregistre d'abord le document pour lui associer des notes."
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.rightPaneView = "notes"
+                }
+                Button {
+                  text: "Journal"
+                  selected: root.rightPaneView === "journal"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.rightPaneView = "journal"
+                }
+                Text {
+                  visible: root.compiling
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "· compilation…"
+                  color: root.faint
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+                // Icon-only, monochrome (Font Awesome eye/eye-slash) —
+                // purely about whether the Typst compile pipeline runs,
+                // independent of which view (Aperçu/Notes/Journal) is
+                // currently shown.
+                Button {
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: root.previewEnabled ? "" : ""
+                  tooltipText: root.previewEnabled
+                    ? "Désactiver l'aperçu (utile sur un document volumineux)"
+                    : "Réactiver l'aperçu"
+                  selected: root.previewEnabled
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.setPreviewEnabled(!root.previewEnabled)
+                }
+              }
+            }
+
             Rectangle {
               id: fileTreePanel
-              visible: root.leftPanelMode === "files"
+              visible: !root.leftPanelHidden && root.leftPanelMode === "files"
+              anchors.top: topIconRow.bottom
+              anchors.topMargin: Style.space(6)
               width: Style.space(280)
-              height: parent.height
+              height: parent.height - topIconRow.height - Style.space(6)
               color: Qt.darker(root.bg, 1.05)
               border.color: root.faint
               border.width: 1
@@ -2082,9 +2688,11 @@ Item {
             // compiler-error list already relies on.
             Rectangle {
               id: headingsPanel
-              visible: root.leftPanelMode === "headings"
+              visible: !root.leftPanelHidden && root.leftPanelMode === "headings"
+              anchors.top: topIconRow.bottom
+              anchors.topMargin: Style.space(6)
               width: Style.space(280)
-              height: parent.height
+              height: parent.height - topIconRow.height - Style.space(6)
               color: Qt.darker(root.bg, 1.05)
               border.color: root.faint
               border.width: 1
@@ -2154,16 +2762,268 @@ Item {
               }
             }
 
+            // Projet (Gabriel's idea, 2026-09-02, second round) — same
+            // panel slot/style as Fichiers/Titres above, shown instead of
+            // them (leftPanelMode is one of the three, never more than
+            // one — same rule as Fichiers/Titres already followed). Two
+            // parts: a scaffold button (createNewProject(), above) and the
+            // MultiDoc staging list — reorder by dragging the ≡ handle,
+            // #include lines get generated from this list invisibly at
+            // compile time (see this file's own "--- MultiDoc / Projet"
+            // comment further up). No "Insérer" action here on purpose —
+            // that was the SECOND design tried for this feature and
+            // Gabriel corrected it back to invisible/auto-synced; the
+            // document itself is edited by switching between file-tree
+            // entries, not by hand-placing #include lines.
+            Rectangle {
+              id: projectPanel
+              visible: !root.leftPanelHidden && root.leftPanelMode === "project"
+              anchors.top: topIconRow.bottom
+              anchors.topMargin: Style.space(6)
+              width: Style.space(280)
+              height: parent.height - topIconRow.height - Style.space(6)
+              color: Qt.darker(root.bg, 1.05)
+              border.color: root.faint
+              border.width: 1
+              radius: Style.cornerRadius
+              clip: true
+
+              Column {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(6)
+
+                Button {
+                  width: parent.width
+                  text: "Créer un nouveau projet"
+                  bordered: true
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.beginPathEntry("newProject", (root.fileTreeDir || root.fileTreeHomeDir()) + "/nouveau-projet")
+                }
+
+                Text {
+                  visible: root.newProjectError !== ""
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: root.newProjectError
+                  color: root.urgentColor
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                PanelSeparator { foreground: root.fg; width: parent.width }
+
+                // Quick access to the two files every project scaffolded by
+                // "Créer un nouveau projet" always has (Gabriel's ask,
+                // 2026-09-02) — same openPathInNewTab() the row eye buttons
+                // below use, just against a fixed name in docDir instead of
+                // a staged path. Disabled rather than hidden when there's
+                // no docDir yet (untitled document) — same reasoning as the
+                // rest of this panel's availability gating.
+                Row {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Button {
+                    text: "maître.typ"
+                    enabled: root.docDir !== ""
+                    foreground: root.fg
+                    accent: root.accentColor
+                    onClicked: root.openPathInNewTab(root.docDir + "/maître.typ")
+                  }
+                  Button {
+                    text: "lib.typ"
+                    enabled: root.docDir !== ""
+                    foreground: root.fg
+                    accent: root.accentColor
+                    onClicked: root.openPathInNewTab(root.docDir + "/lib.typ")
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: "Fichiers .typ inclus dans ce document à la compilation, dans cet ordre (glisse ≡ pour réordonner) :"
+                  color: root.faint
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Text {
+                  visible: !root.multidocAvailable
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: "Enregistre d'abord ce document pour lui associer une liste."
+                  color: root.faint
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Item {
+                  id: multidocListArea
+                  width: parent.width
+                  visible: root.multidocAvailable
+                  readonly property real rowHeight: Style.space(32)
+                  height: root.multidocPaths.length * rowHeight
+
+                  Repeater {
+                    model: root.multidocPaths
+
+                    Rectangle {
+                      id: multidocRow
+                      required property int index
+                      required property string modelData
+                      width: multidocListArea.width
+                      height: multidocListArea.rowHeight - Style.space(4)
+                      y: index * multidocListArea.rowHeight
+                      z: dragHandle.drag.active ? 100 : 0
+                      color: dragHandle.drag.active ? Qt.darker(root.bg, 1.15) : "transparent"
+                      radius: Style.cornerRadius
+                      border.color: dragHandle.drag.active ? root.accentColor : "transparent"
+                      border.width: 1
+
+                      MouseArea {
+                        id: dragHandle
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        width: Style.space(18)
+                        cursorShape: Qt.SizeVerCursor
+                        drag.target: multidocRow
+                        drag.axis: Drag.YAxis
+                        drag.minimumY: 0
+                        drag.maximumY: Math.max(0, (root.multidocPaths.length - 1) * multidocListArea.rowHeight)
+                        onReleased: {
+                          var targetIndex = Math.round(multidocRow.y / multidocListArea.rowHeight)
+                          targetIndex = Math.max(0, Math.min(root.multidocPaths.length - 1, targetIndex))
+                          if (targetIndex !== multidocRow.index) root.multidocReordered(multidocRow.index, targetIndex)
+                          else multidocRow.y = multidocRow.index * multidocListArea.rowHeight
+                        }
+
+                        Text {
+                          anchors.centerIn: parent
+                          text: "≡"
+                          color: root.faint
+                          font.pixelSize: Style.font.bodySmall
+                        }
+                      }
+
+                      TextField {
+                        id: multidocPathField
+                        anchors.left: dragHandle.right
+                        anchors.leftMargin: Style.space(4)
+                        anchors.right: multidocViewButton.left
+                        anchors.rightMargin: Style.space(4)
+                        anchors.verticalCenter: parent.verticalCenter
+                        font.pixelSize: Style.font.bodySmall
+                        placeholderText: "/chemin/fichier.typ"
+                        // No declarative `text:` binding — same trap as
+                        // pathBarField/notesField elsewhere in this file (a
+                        // TextField's binding is destroyed the instant the
+                        // user types). Committed on focus-out/Entrée
+                        // (onEditingFinished) rather than on every
+                        // keystroke: committing live would reassign
+                        // root.multidocPaths (a fresh array, see this
+                        // section's own header comment) on every character
+                        // typed, rebuilding this entire Repeater —
+                        // including the very field being typed into — and
+                        // dropping focus mid-word.
+                        //
+                        // Shows the filename only once committed (Gabriel's
+                        // ask, 2026-09-02) — Component.onCompleted seeds
+                        // that friendly form, and every commit triggers the
+                        // same reseed for free (multidocPathEdited always
+                        // reassigns root.multidocPaths, rebuilding this
+                        // whole Repeater). Gaining focus swaps back to the
+                        // real full path so there's something meaningful to
+                        // edit; onEditingFinished's own commit above fires
+                        // on blur, right before the reseed takes over.
+                        Component.onCompleted: text = root.multidocDisplayName(multidocRow.modelData)
+                        onActiveFocusChanged: if (activeFocus) text = multidocRow.modelData
+                        onEditingFinished: root.multidocPathEdited(multidocRow.index, text)
+
+                        DropArea {
+                          anchors.fill: parent
+                          // A file dragged in from Nautilus lands as a
+                          // text/uri-list "file:///..." URL, not a plain
+                          // path — untested against this specific
+                          // GTK-app-to-QtQuick Wayland DnD path, confirm
+                          // live. Falls back to hasText for a plain path
+                          // pasted via drag from somewhere else.
+                          onDropped: function(drop) {
+                            var raw = ""
+                            if (drop.hasUrls && drop.urls.length > 0) raw = drop.urls[0].toString()
+                            else if (drop.hasText) raw = drop.text
+                            raw = raw.trim()
+                            if (raw.indexOf("file://") === 0) raw = decodeURIComponent(raw.slice(7))
+                            if (!raw) return
+                            multidocPathField.text = raw
+                            root.multidocPathEdited(multidocRow.index, raw)
+                          }
+                        }
+                      }
+
+                      // Monochrome eye (Gabriel's ask, 2026-09-02) — same
+                      // Font Awesome glyph (U+F06E) already confirmed to
+                      // render in this shell's icon font by the Aperçu
+                      // eye-toggle button in EditorTab.qml.
+                      Button {
+                        id: multidocViewButton
+                        anchors.right: multidocRemoveButton.left
+                        anchors.rightMargin: Style.space(4)
+                        anchors.verticalCenter: parent.verticalCenter
+                        iconText: ""
+                        enabled: multidocRow.modelData && multidocRow.modelData.charAt(0) === "/"
+                        tooltipText: "Ouvrir dans un nouvel onglet"
+                        foreground: root.fg
+                        accent: root.accentColor
+                        onClicked: root.multidocOpenInNewTab(multidocRow.index)
+                      }
+
+                      Button {
+                        id: multidocRemoveButton
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "✕"
+                        tooltipText: "Retirer cette ligne"
+                        foreground: root.fg
+                        accent: root.urgentColor
+                        onClicked: root.multidocRemove(multidocRow.index)
+                      }
+                    }
+                  }
+                }
+
+                Text {
+                  visible: root.multidocAvailable && root.multidocPaths.length === 0
+                  text: "Aucun fichier ajouté."
+                  color: root.faint
+                  font.family: root.uiFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Button {
+                  visible: root.multidocAvailable
+                  text: "+ Ajouter une ligne"
+                  bordered: true
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.multidocAdd()
+                }
+              }
+            }
+
             EditorTab {
               id: editorTabItem
               anchors.left: parent.left
-              anchors.leftMargin: root.leftPanelMode !== "" ? (Style.space(280) + Style.space(10)) : 0
-              anchors.top: parent.top
+              anchors.leftMargin: !root.leftPanelHidden ? (Style.space(280) + Style.space(10)) : 0
+              anchors.top: topIconRow.bottom
+              anchors.topMargin: Style.space(6)
               anchors.right: parent.right
               anchors.bottom: parent.bottom
               text: root.docText
               errors: root.compileErrors
-              compiling: root.compiling
               previewSources: root.previewSources
               foreground: root.fg
               background: root.bg
@@ -2186,8 +3046,6 @@ Item {
               suggestBusy: root.suggestBusy
               rightPaneView: root.rightPaneView
               notesText: root.notesText
-              notesAvailable: root.docPath !== ""
-              leftPanelMode: root.leftPanelMode
               journalDir: root.journalDir
               journalViewYear: root.journalViewYear
               journalViewMonth: root.journalViewMonth
@@ -2199,16 +3057,12 @@ Item {
               onTextEdited: function(newText) { root.onTextEdited(newText) }
               onZoomInRequested: root.setEditorZoom(root.editorZoom + 0.1)
               onZoomOutRequested: root.setEditorZoom(root.editorZoom - 0.1)
-              onPreviewToggleRequested: root.setPreviewEnabled(!root.previewEnabled)
               onLineNumbersToggleRequested: root.setLineNumbersEnabled(!root.lineNumbersEnabled)
               onNarrowMarginsToggleRequested: root.setNarrowMarginsEnabled(!root.narrowMarginsEnabled)
-              onRightPaneHiddenToggleRequested: root.setRightPaneHidden(!root.rightPaneHidden)
               onSpellcheckRequested: function(text) { root.requestSpellcheck(text) }
               onSuggestRequested: function(word) { root.requestSuggestions(word) }
               onApplySuggestionRequested: function(start, end, replacement) { root.applySuggestion(start, end, replacement) }
-              onRightPaneViewRequested: function(view) { root.rightPaneView = view }
               onNotesEdited: function(newText) { root.onNotesEdited(newText) }
-              onLeftPanelModeRequested: function(mode) { root.leftPanelMode = (root.leftPanelMode === mode) ? "" : mode }
               onJournalPrevMonthRequested: root.journalPrevMonth()
               onJournalNextMonthRequested: root.journalNextMonth()
               onJournalDaySelected: function(day) { root.journalSelectDay(day) }

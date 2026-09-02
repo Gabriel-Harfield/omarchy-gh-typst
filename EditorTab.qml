@@ -25,7 +25,6 @@ Item {
 
   required property string text
   required property var errors
-  required property bool compiling
   required property var previewSources
   required property color foreground
   required property color background
@@ -42,10 +41,11 @@ Item {
   required property bool narrowMarginsEnabled
   // Whether the whole Aperçu/Notes right pane is collapsed, giving the
   // editor the full width — Gabriel's ask, 2026-08-29 ("investigate
-  // hiding the Aperçu/Notes section"), left to my own design call on
-  // exact UX. A single toggle in the editor's own header (always
-  // reachable, in both states) rather than one only visible from the
-  // preview side, which would strand the user with no way back.
+  // hiding the Aperçu/Notes section"). The toggle button itself moved out
+  // to Panel.qml, 2026-09-02, to sit on the same top row as the left
+  // panel's own hide/show button (Gabriel's alignment ask) — this
+  // property is read-only from here now, purely to size/hide the pane
+  // below.
   required property bool rightPaneHidden
   // Local system spellcheck (hunspell, no Claude) — Gabriel's explicit
   // ask, 2026-08-29. misspelledWords is Panel.qml's latest detection
@@ -83,22 +83,12 @@ Item {
   required property int journalSelectedDay
   required property string journalText
   required property var journalEntryDays
-  // Left panel (file tree / heading outline) — "" | "files" | "headings".
-  // Lives in Panel.qml (it owns the actual panel layout, a sibling of
-  // this whole component, not a child of it) but the toggle buttons
-  // themselves sit in THIS component's own header row, next to the
-  // "Éditeur" label — Gabriel's explicit placement correction,
-  // 2026-08-29, moved down from the outer tab bar.
-  required property string leftPanelMode
-  required property bool notesAvailable
 
   signal textEdited(string newText)
   signal zoomInRequested()
   signal zoomOutRequested()
-  signal previewToggleRequested()
   signal lineNumbersToggleRequested()
   signal narrowMarginsToggleRequested()
-  signal rightPaneHiddenToggleRequested()
   signal journalPrevMonthRequested()
   signal journalNextMonthRequested()
   signal journalDaySelected(int day)
@@ -106,9 +96,7 @@ Item {
   signal spellcheckRequested(string text)
   signal suggestRequested(string word)
   signal applySuggestionRequested(int start, int end, string replacement)
-  signal rightPaneViewRequested(string view)
   signal notesEdited(string newText)
-  signal leftPanelModeRequested(string mode)
 
   // See notesField's own comment (below, in the right-pane Notes view)
   // for why this guard exists — imperative resync instead of a plain
@@ -390,10 +378,29 @@ Item {
   // re-query positionToRectangle().
   property int layoutVersion: 0
 
+  // TEMPORARY diagnostic switch, 2026-09-02 round four — REDESIGNED after
+  // two real bugs from the previous version (see git history/memory for
+  // the full story: skipping the `inputEdit.text = ...` reassignment
+  // entirely blanked the editor, twice, in two different ways). This
+  // version NEVER skips the reassignment — inputEdit.text is reassigned
+  // every recolor pass exactly like normal, so there is no "stale/frozen
+  // buffer" failure mode possible this time. The only thing this flag
+  // changes is WHICH html generator runs: Highlighter.toPlainHtml() (no
+  // color scanning at all, same escaping/newline/whitespace handling)
+  // instead of Highlighter.toHtml(). Isolates exactly what Gabriel wants
+  // to know: is the coloring logic itself the cost, or is QML's
+  // TextEdit/RichText relayout expensive regardless of markup content
+  // (same document size, same wholesale-reassign pattern, either way)?
+  // Flip back to false (or delete) once tested — coloring will be
+  // visibly gone while this is true, that's the point.
+  property bool _colorDiagnosticDisabled: false
+
   function renderPlainText(plain) {
     root._programmatic = true
     var savedPos = inputEdit.cursorPosition
-    inputEdit.text = Highlighter.toHtml(plain)
+    inputEdit.text = root._colorDiagnosticDisabled
+      ? Highlighter.toPlainHtml(plain)
+      : Highlighter.toHtml(plain)
     root._lastPlainText = plain
     root._pushUndoSnapshot(plain)
     // Gutter text lags one recolor pass behind _lastPlainText on purpose
@@ -501,7 +508,21 @@ Item {
   property int lineStart: 0
   property int lineEnd: 0
 
+  // TEMPORARY diagnostic switch, 2026-09-02 — same pattern as Panel.qml's
+  // _spellcheckDiagnosticDisabled, same reason: Gabriel's own long-
+  // standing suspicion (this feature's history already includes real
+  // rendering bugs, see this file's header/lineStart comments) about
+  // whether the current-block highlight is a remaining cost now that the
+  // gutter/misspelled-word overlays are virtualized and spellcheck is
+  // paused. Flip back to false (or delete) once the diagnostic test is
+  // done. Gates BOTH the cheap string-scan in _updateCurrentLine() below
+  // AND, more importantly, currentLineHighlight's own positionToRectangle()
+  // calls further down — a true suspend, not just a hidden Rectangle
+  // whose bindings still evaluate.
+  property bool _currentLineHighlightDiagnosticDisabled: false
+
   function _updateCurrentLine() {
+    if (root._currentLineHighlightDiagnosticDisabled) return
     var t = root._lastPlainText
     var p = Math.max(0, Math.min(inputEdit.cursorPosition, t.length))
     var s = t.lastIndexOf("\n", p - 1) + 1
@@ -541,6 +562,70 @@ Item {
   }
   readonly property int lineCount: lineOffsets.length
   readonly property int gutterWidth: Style.space(16) + Math.ceil(String(Math.max(1, root.lineCount)).length * root.editorFontSize * 0.62)
+
+  // Virtualization for the two per-line/per-word overlays below (gutter
+  // numbers, misspelled-word underlines) — Gabriel's 2026-09-02 report:
+  // with line numbers OFF, the editor still lagged on his 2500-line
+  // stress document on a lower-clocked CPU (powersave governor / on
+  // battery). Root cause, confirmed by actually counting flagged
+  // occurrences in that file: spellcheck flags ~1500 token occurrences
+  // (Typst identifiers hunspell doesn't know, not real typos), and —
+  // independent of the line-numbers toggle — the misspelled-word
+  // Repeater built one delegate PER OCCURRENCE, each calling
+  // positionToRectangle() twice, re-evaluated on every recolor pass
+  // (~300ms while typing). ~3000 native layout calls every pause is
+  // real CPU cost. The line-number gutter (one delegate per document
+  // line) would hit the exact same problem the moment it's switched
+  // back on for a large document.
+  //
+  // Fix: feed both Repeaters only the lines/words inside (or near) the
+  // visible viewport, computed via inputEdit.positionAt() — the inverse
+  // of positionToRectangle() — using the same
+  // inputEdit.y-plus-local-y convention ensureCursorVisible() already
+  // relies on. A one-viewport-height buffer above and below keeps fast
+  // scrolling from flashing empty numbers/underlines before the next
+  // recompute lands. This binding re-runs on every scroll (reads
+  // flick.contentY) AND every recolor (reads layoutVersion), but the
+  // recompute itself is just two positionAt() calls plus a plain array
+  // filter — no per-line native layout work — so it stays cheap
+  // regardless of document size.
+  readonly property var _visibleTextRange: {
+    var _dep = root.layoutVersion // re-run once layout has settled after a recolor
+    var flick = editorScroll.contentItem
+    var fallback = { start: 0, end: root._lastPlainText.length }
+    if (!flick || typeof flick.contentY !== "number") return fallback
+    var buffer = editorScroll.height
+    var topY = flick.contentY - inputEdit.y - buffer
+    var botY = flick.contentY - inputEdit.y + editorScroll.height + buffer
+    var startPos = inputEdit.positionAt(0, Math.max(0, topY))
+    var endPos = inputEdit.positionAt(0, botY)
+    return {
+      start: startPos >= 0 ? startPos : 0,
+      end: endPos >= 0 ? endPos : root._lastPlainText.length
+    }
+  }
+
+  readonly property var visibleLineNumbers: {
+    if (!root.lineNumbersEnabled) return []
+    var offs = root.lineOffsets
+    var r = root._visibleTextRange
+    var out = []
+    for (var i = 0; i < offs.length; i++) {
+      if (offs[i] >= r.start && offs[i] <= r.end) out.push({ line: i + 1, offset: offs[i] })
+    }
+    return out
+  }
+
+  readonly property var visibleMisspelledWords: {
+    var r = root._visibleTextRange
+    var out = []
+    var words = root.misspelledWords
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i]
+      if (w.end >= r.start && w.start <= r.end) out.push(w)
+    }
+    return out
+  }
 
   function jumpToError(err) {
     if (!err || err.line <= 0) return
@@ -637,26 +722,6 @@ Item {
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(6)
 
-          // Left-panel toggle pair (file tree / heading outline) —
-          // repositioned here, next to the "Éditeur" label, per Gabriel's
-          // explicit correction 2026-08-29 (was on the outer tab bar).
-          Button {
-            iconText: ""
-            tooltipText: "Fichiers"
-            selected: root.leftPanelMode === "files"
-            foreground: root.foreground
-            accent: root.accentColor
-            onClicked: root.leftPanelModeRequested("files")
-          }
-          Button {
-            iconText: ""
-            tooltipText: "Titres du document"
-            selected: root.leftPanelMode === "headings"
-            foreground: root.foreground
-            accent: root.accentColor
-            onClicked: root.leftPanelModeRequested("headings")
-          }
-
           Text {
             id: editorHeaderLabel
             anchors.verticalCenter: parent.verticalCenter
@@ -715,28 +780,41 @@ Item {
             accent: root.accentColor
             onClicked: root.zoomInRequested()
           }
-          Item { width: Style.space(10); height: 1 }
-          // Collapses the whole Aperçu/Notes right pane so the editor
-          // takes the full width — lives here (not on the preview side)
-          // so it's reachable in both states, never stranding the user
-          // with no way back once the pane is hidden.
-          Button {
-            iconText: root.rightPaneHidden ? "" : ""
-            selected: root.rightPaneHidden
-            tooltipText: root.rightPaneHidden
-              ? "Réafficher le panneau Aperçu/Notes"
-              : "Masquer le panneau Aperçu/Notes (l'éditeur prend toute la largeur)"
-            foreground: root.foreground
-            accent: root.accentColor
-            onClicked: root.rightPaneHiddenToggleRequested()
-          }
         }
       }
 
-      ScrollView {
-        id: editorScroll
+      // Wrapper, not just the ScrollView directly — see the WheelHandler
+      // overlay declared right after editorScroll below (Item's default
+      // property lets both be children here) for why: it needs to sit at
+      // the SAME geometry as editorScroll but as a true sibling, not
+      // nested inside its Flickable content, and a plain Column can't
+      // overlap two children at the same position — this Item can.
+      Item {
+        id: editorScrollWrap
         width: parent.width
         height: parent.height - editorHeader.height - parent.spacing - errorList.height - (errorList.visible ? Style.space(8) : 0) - (findBarDock.visible ? (findBarDock.height + Style.space(8)) : 0)
+
+      ScrollView {
+        id: editorScroll
+        // NOT anchors.fill — confirmed via journalctl to cause a real
+        // "Binding loop detected for property height" (blanking the
+        // whole editor: with the loop unresolved, Qt Quick apparently
+        // gives up and never lays out inputEdit's text at all). Root
+        // cause, best understanding: editorContent's own height binding
+        // further below reads editorScroll.height directly
+        // (Math.max(editorScroll.height, inputEdit.implicitHeight...)) —
+        // that line is untouched, original code, and was always fine
+        // with an explicit height property. But ScrollView (a Control)
+        // also computes its own implicitHeight from its content's
+        // implicit size internally, and anchors.fill's anchor-driven
+        // height binding apparently interacts with that machinery
+        // differently than a plain explicit height: property does,
+        // creating the loop. Back to explicit width/height — the exact
+        // pattern the original, always-working code used, just now
+        // pointed at editorScrollWrap instead of the outer Column
+        // directly (editorScrollWrap already carries the same formula).
+        width: parent.width
+        height: parent.height
         clip: true
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
@@ -764,12 +842,18 @@ Item {
             // the flicker's source; see lineStart/lineEnd's own comment
             // above for the actual fix (freeze during the recolor swap
             // instead of reacting to every cursor-position change).
-            visible: inputEdit.activeFocus && root._lastPlainText.length > 0
+            //
+            // _currentLineHighlightDiagnosticDisabled (see lineStart's own
+            // comment) short-circuits _startRect/_endRect to a fixed
+            // Qt.rect() below instead of calling positionToRectangle() at
+            // all when true — a real suspend of the native call, not just
+            // an invisible Rectangle whose bindings still evaluate it.
+            visible: !root._currentLineHighlightDiagnosticDisabled && inputEdit.activeFocus && root._lastPlainText.length > 0
             color: Qt.rgba(0.5, 0.5, 0.5, 0.14)
             x: inputEdit.x
             width: inputEdit.width
-            property rect _startRect: inputEdit.positionToRectangle(root.lineStart)
-            property rect _endRect: inputEdit.positionToRectangle(Math.max(root.lineStart, root.lineEnd))
+            property rect _startRect: root._currentLineHighlightDiagnosticDisabled ? Qt.rect(0, 0, 0, 0) : inputEdit.positionToRectangle(root.lineStart)
+            property rect _endRect: root._currentLineHighlightDiagnosticDisabled ? Qt.rect(0, 0, 0, 0) : inputEdit.positionToRectangle(Math.max(root.lineStart, root.lineEnd))
             y: inputEdit.y + _startRect.y
             height: Math.max(_startRect.height, (_endRect.y + _endRect.height) - _startRect.y)
           }
@@ -788,11 +872,16 @@ Item {
           // first gives the binding a real, tracked dependency that fires
           // on every edit and on the initial render alike.
           Repeater {
-            model: root.lineNumbersEnabled ? root.lineOffsets : []
+            // Filtered to the visible viewport (+ buffer), not the whole
+            // document — see root._visibleTextRange/visibleLineNumbers'
+            // own comment for why: a per-line Repeater over a 2500-line
+            // document was real, reproduced input lag even before this,
+            // and stays a live risk if left unfiltered now that the
+            // misspelled-word overlay below has the same shape.
+            model: root.visibleLineNumbers
             Text {
-              required property int index
               required property var modelData
-              text: String(index + 1)
+              text: String(modelData.line)
               color: root.faint
               font.family: root.monoFont
               font.pixelSize: root.editorFontSize
@@ -817,7 +906,7 @@ Item {
                 // pass, not just theory — contentHeight was defensive
                 // insurance that turned out to be the actual cost.
                 var _layoutDep = root._gutterText + "|" + root.layoutVersion
-                return inputEdit.y + inputEdit.positionToRectangle(Math.min(modelData, inputEdit.length)).y
+                return inputEdit.y + inputEdit.positionToRectangle(Math.min(modelData.offset, inputEdit.length)).y
               }
             }
           }
@@ -832,7 +921,13 @@ Item {
           // that's actually proven safe here is much lower risk than
           // threading a second, independent highlighting concern into it.
           Repeater {
-            model: root.misspelledWords
+            // Filtered to the visible viewport (+ buffer) — see
+            // root._visibleTextRange/visibleMisspelledWords' own comment.
+            // This was the real remaining cost even with line numbers
+            // off: ~1500 flagged occurrences on Gabriel's stress
+            // document, unconditionally rebuilt (2 positionToRectangle()
+            // calls each) every recolor pass regardless of that toggle.
+            model: root.visibleMisspelledWords
             Rectangle {
               required property var modelData
               // Both explicitly read root.layoutVersion so they
@@ -980,13 +1075,69 @@ Item {
           // Recolors from the last known-good plain text after the user
           // pauses typing — never mid-keystroke, so an in-progress word
           // isn't rebuilt out from under the caret on every character.
+          //
+          // Interval scales with document size — my own idea, 2026-09-02,
+          // on top of Gabriel's diagnostic requests above: every recolor
+          // reassigns inputEdit.text wholesale, forcing Qt to relayout the
+          // WHOLE RichText document, not just the changed part (see this
+          // file's header comment on the architecture). That cost grows
+          // with document size but the interval never did, so a large
+          // document paid full relayout cost every 300ms during a
+          // sustained typing burst regardless of anything else running.
+          // Widening the interval on a big document is a cheap, low-risk
+          // lever — it doesn't touch Highlighter.js or the relayout
+          // mechanism at all, just how often it runs — at the cost of
+          // colors/gutter/current-line lagging a bit further behind while
+          // typing fast. Thresholds are a first guess (Gabriel's stress
+          // document is ~68KB), worth retuning together once tested live.
           Timer {
             id: recolorDebounce
-            interval: 300
+            interval: root._lastPlainText.length > 50000 ? 600
+              : (root._lastPlainText.length > 20000 ? 450 : 300)
             repeat: false
             onTriggered: root.renderPlainText(root._lastPlainText)
           }
         }
+      }
+
+      // Wheel-scroll overlay, 2026-09-02 round two — a TRUE sibling of
+      // editorScroll (via editorScrollWrap above), not nested inside its
+      // Flickable content like the first attempt was. Gabriel reported
+      // "quasiment aucune inertie" even after drastically lowering
+      // flickDeceleration and raising the velocity multiplier on that
+      // first version — the most likely explanation is event-priority
+      // ambiguity between a WheelHandler nested INSIDE a Flickable's own
+      // content and that same Flickable's native wheelEvent() override
+      // (a different, older event pathway); the Flickable may well have
+      // still been doing its own default (slow, non-inertial) wheel
+      // handling in parallel or instead. Declared here, AFTER editorScroll
+      // in the same parent, this Item sits on top in both paint and
+      // hit-test order — it always gets first look at a wheel event,
+      // before the ScrollView underneath ever sees it, no ambiguity left.
+      // A bare WheelHandler (no MouseArea) only ever claims wheel events,
+      // never mouse press/click/drag, so text selection, scrollbar
+      // dragging, and the misspelled-word right-click menu underneath all
+      // keep working exactly as before.
+      Item {
+        anchors.fill: editorScrollWrap
+        WheelHandler {
+          target: null
+          onWheel: function(event) {
+            var flick = editorScroll.contentItem
+            if (!flick || typeof flick.contentY !== "number") return
+            // 2026-09-02, round three: Gabriel confirmed round two was a
+            // real improvement but still needed "des dizaines" of notches
+            // to move through a longer document — pushed hard again, both
+            // the throw strength and the deceleration (longer coast).
+            flick.flickDeceleration = 250
+            var dy = event.angleDelta.y !== 0
+              ? (event.angleDelta.y / 120) * 450
+              : event.pixelDelta.y * 12
+            flick.flick(0, dy * 20)
+            event.accepted = true
+          }
+        }
+      }
       }
 
       // ------------------------------------------------------ find/replace
@@ -1167,73 +1318,6 @@ Item {
       height: parent.height
       spacing: Style.space(8)
 
-      Item {
-        width: parent.width
-        height: previewHeaderRow.implicitHeight
-
-        Row {
-          id: previewHeaderRow
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(8)
-
-          // Aperçu/Notes: which content the right pane shows — not the
-          // same axis as the eye icon below, which is whether Typst
-          // compilation even runs at all (Gabriel's explicit split,
-          // 2026-08-29): you can be looking at Notes while the preview
-          // keeps compiling in the background, or looking at Aperçu with
-          // compilation paused on a large document.
-          Button {
-            text: "Aperçu"
-            selected: root.rightPaneView === "apercu"
-            foreground: root.dim
-            accent: root.accentColor
-            onClicked: root.rightPaneViewRequested("apercu")
-          }
-          Button {
-            text: "Notes"
-            selected: root.rightPaneView === "notes"
-            enabled: root.notesAvailable
-            tooltipText: root.notesAvailable ? "" : "Enregistre d'abord le document pour lui associer des notes."
-            foreground: root.dim
-            accent: root.accentColor
-            onClicked: root.rightPaneViewRequested("notes")
-          }
-          Button {
-            text: "Journal"
-            selected: root.rightPaneView === "journal"
-            foreground: root.dim
-            accent: root.accentColor
-            onClicked: root.rightPaneViewRequested("journal")
-          }
-          Text {
-            visible: root.compiling
-            text: "· compilation…"
-            color: root.faint
-            font.family: root.uiFont
-            font.pixelSize: Style.font.bodySmall
-          }
-        }
-
-        // Icon-only, monochrome (Font Awesome eye/eye-slash — confirmed
-        // available in this shell's icon font, same family already used
-        // elsewhere in Omarchy's own shell source) — Gabriel's explicit
-        // ask, 2026-08-29, replacing the old "👁 Actif"/"👁 Coupé" text
-        // button. Purely about whether the Typst compile pipeline runs,
-        // independent of which view (Aperçu/Notes) is currently shown.
-        Button {
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          iconText: root.previewEnabled ? "" : ""
-          tooltipText: root.previewEnabled
-            ? "Désactiver l'aperçu (utile sur un document volumineux)"
-            : "Réactiver l'aperçu"
-          selected: root.previewEnabled
-          foreground: root.foreground
-          accent: root.accentColor
-          onClicked: root.previewToggleRequested()
-        }
-      }
 
       Rectangle {
         width: parent.width
@@ -1285,6 +1369,30 @@ Item {
                 cache: false
                 fillMode: Image.PreserveAspectFit
               }
+            }
+          }
+        }
+
+        // True sibling of previewScrollContent (this Rectangle, unlike a
+        // Column, positions children by anchors rather than stacking them,
+        // so an overlay at the same geometry is possible here) — declared
+        // after it, so it sits on top for wheel hit-testing, same fix and
+        // same reasoning as the editor's own overlay above (see its
+        // comment for why the previous nested-WheelHandler attempt likely
+        // did little).
+        Item {
+          anchors.fill: previewScrollContent
+          WheelHandler {
+            target: null
+            onWheel: function(event) {
+              var flick = previewScrollContent.contentItem
+              if (!flick || typeof flick.contentY !== "number") return
+              flick.flickDeceleration = 250
+              var dy = event.angleDelta.y !== 0
+                ? (event.angleDelta.y / 120) * 450
+                : event.pixelDelta.y * 12
+              flick.flick(0, dy * 20)
+              event.accepted = true
             }
           }
         }
