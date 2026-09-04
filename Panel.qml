@@ -64,6 +64,7 @@ Item {
     root.newDocument()
     root.notesText = ""
     editorTabItem.clearUndoHistory()
+    root.errorLogWindowVisible = false
   }
 
   // The one gate every "the user wants to close this" path should go
@@ -1154,8 +1155,53 @@ Item {
 
   // --- compile pipeline (live preview + real compiler diagnostics) -----
 
+  // Raw, un-deduplicated diagnostics straight from compile.sh — kept around
+  // untouched for errorLogWindow (Gabriel wants the option to see the real
+  // full output, not just the collapsed inline view).
   property var compileErrors: []
   property bool compiling: false
+  // Whether the full-log window (below) is open.
+  property bool errorLogWindowVisible: false
+
+  // A single syntax slip (Gabriel's report 2026-09-04: an unclosed
+  // `#h(1fr)`) can send the Typst compiler cascading into a dozen-plus
+  // near-identical diagnostics in one compile pass. Shown raw, that flooded
+  // EditorTab's inline error Column, whose height is subtracted from the
+  // editor viewport's own (see EditorTab's editorScroll height binding) —
+  // enough rows and the editor itself got squeezed out from under him
+  // mid-edit. This collapses exact-message repeats into one row with a
+  // "(×N)" count, then caps the inline list so it can never do that again;
+  // anything over the cap folds into a single "+N autres" row that opens
+  // errorLogWindow instead of jumping to a line.
+  function _dedupedErrors(list) {
+    var seen = {}
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i]
+      var idx = seen[e.message]
+      if (idx === undefined) {
+        seen[e.message] = out.length
+        out.push({ line: e.line, col: e.col, severity: e.severity, message: e.message, count: 1 })
+      } else {
+        out[idx].count += 1
+      }
+    }
+    return out
+  }
+
+  readonly property int _inlineErrorCap: 6
+  readonly property var compileErrorsInline: {
+    var deduped = root._dedupedErrors(root.compileErrors)
+    if (deduped.length <= root._inlineErrorCap) return deduped
+    var shown = deduped.slice(0, root._inlineErrorCap - 1)
+    var hiddenCount = 0
+    for (var i = root._inlineErrorCap - 1; i < deduped.length; i++) hiddenCount += deduped[i].count
+    shown.push({
+      line: 0, col: 0, severity: "error", isMore: true,
+      message: "+" + hiddenCount + (hiddenCount > 1 ? " autres erreurs" : " autre erreur") + " — voir le journal complet"
+    })
+    return shown
+  }
   property int previewVersion: 0
   property int previewPageCount: 0
   // Array of "file://.../.ghtypst-preview-N.png?v=version" strings, one
@@ -3023,7 +3069,7 @@ Item {
               anchors.right: parent.right
               anchors.bottom: parent.bottom
               text: root.docText
-              errors: root.compileErrors
+              errors: root.compileErrorsInline
               previewSources: root.previewSources
               foreground: root.fg
               background: root.bg
@@ -3063,6 +3109,7 @@ Item {
               onSuggestRequested: function(word) { root.requestSuggestions(word) }
               onApplySuggestionRequested: function(start, end, replacement) { root.applySuggestion(start, end, replacement) }
               onNotesEdited: function(newText) { root.onNotesEdited(newText) }
+              onShowErrorLogRequested: root.errorLogWindowVisible = true
               onJournalPrevMonthRequested: root.journalPrevMonth()
               onJournalNextMonthRequested: root.journalNextMonth()
               onJournalDaySelected: function(day) { root.journalSelectDay(day) }
@@ -3225,6 +3272,112 @@ Item {
           var action = root._pendingDiscardAction
           root._pendingDiscardAction = null
           if (action) action()
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------- error log
+  // window
+  //
+  // The raw, un-deduplicated compile.sh output (root.compileErrors) shown
+  // in full — Gabriel's ask 2026-09-04, companion to the inline list's own
+  // dedup+cap (see compileErrorsInline above): the inline view stays short
+  // and readable, and this is where the complete picture still lives on
+  // request. A separate FloatingWindow (not a Popup over `window`) because
+  // he specifically asked for "une fenêtre à part" — room to actually read
+  // a long cascade without it fighting the editor for space.
+  FloatingWindow {
+    id: errorLogWindow
+    title: "GH Typst — Journal complet"
+    color: root.bg
+    visible: root.errorLogWindowVisible
+    implicitWidth: Style.space(640)
+    implicitHeight: Style.space(600)
+    minimumSize: Qt.size(Style.space(400), Style.space(300))
+
+    onVisibleChanged: {
+      if (!visible) root.errorLogWindowVisible = false
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      color: root.bg
+    }
+
+    Column {
+      anchors.fill: parent
+      anchors.margins: Style.space(16)
+      spacing: Style.space(10)
+
+      Item {
+        width: parent.width
+        height: logHeaderText.implicitHeight
+
+        Text {
+          id: logHeaderText
+          text: root.compileErrors.length + (root.compileErrors.length > 1 ? " diagnostics" : " diagnostic")
+          color: root.fg
+          font.family: root.uiFont
+          font.pixelSize: Style.font.heading
+          font.bold: true
+        }
+
+        Button {
+          anchors.right: parent.right
+          text: "Fermer"
+          foreground: root.fg
+          accent: root.accentColor
+          onClicked: root.errorLogWindowVisible = false
+        }
+      }
+
+      ScrollView {
+        id: errorLogScroll
+        width: parent.width
+        height: parent.height - logHeaderText.implicitHeight - parent.spacing
+        clip: true
+        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+        Column {
+          width: errorLogScroll.availableWidth
+          spacing: Style.space(8)
+
+          Repeater {
+            model: root.compileErrors
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                text: modelData.severity === "warning" ? "◐" : "✕"
+                color: modelData.severity === "warning" ? root.warningColor : root.urgentColor
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                width: parent.width - Style.space(20)
+                textFormat: Text.PlainText
+                text: (modelData.line > 0 ? ("L" + modelData.line + ":" + modelData.col + " — ") : "") + modelData.message
+                color: root.fg
+                font.family: root.uiFont
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.Wrap
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: modelData.line > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: {
+                    if (modelData.line <= 0) return
+                    root.tab = "editor"
+                    editorTabItem.jumpToLine(modelData.line, modelData.col || 1)
+                    root.errorLogWindowVisible = false
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

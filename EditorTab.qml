@@ -97,6 +97,7 @@ Item {
   signal suggestRequested(string word)
   signal applySuggestionRequested(int start, int end, string replacement)
   signal notesEdited(string newText)
+  signal showErrorLogRequested()
 
   // See notesField's own comment (below, in the right-pane Notes view)
   // for why this guard exists — imperative resync instead of a plain
@@ -1272,11 +1273,50 @@ Item {
       }
 
       // ---------------------------------------------------- error list
+      // root.errors already arrives deduplicated and capped from Panel.qml
+      // (see compileErrorsInline there) — a single unclosed paren/bracket
+      // sends the Typst compiler cascading into a dozen-plus near-identical
+      // diagnostics, which used to flood this Column and squeeze the editor
+      // out of view (its height is subtracted from editorScroll's, see the
+      // height binding above). Each row's "count" (when > 1) reflects how
+      // many times that exact message repeated in the raw compiler output;
+      // the "Journal complet" button opens the untouched full list in its
+      // own window — see Panel.qml's errorLogWindow.
       Column {
         id: errorList
         width: parent.width
         visible: root.errors.length > 0
         spacing: Style.space(4)
+
+        Row {
+          width: errorList.width
+          spacing: Style.space(8)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.errors.length + (root.errors.length > 1 ? " erreurs" : " erreur")
+            color: root.dim
+            font.family: root.uiFont
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Journal complet"
+            color: root.accentColor
+            font.family: root.uiFont
+            font.pixelSize: Style.font.bodySmall
+            font.underline: errorLogMouse.containsMouse
+
+            MouseArea {
+              id: errorLogMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.showErrorLogRequested()
+            }
+          }
+        }
 
         Repeater {
           model: root.errors
@@ -1286,7 +1326,7 @@ Item {
             spacing: Style.space(6)
 
             Text {
-              text: modelData.severity === "warning" ? "◐" : "✕"
+              text: modelData.isMore ? "…" : (modelData.severity === "warning" ? "◐" : "✕")
               color: modelData.severity === "warning" ? root.warningColor : root.urgentColor
               font.pixelSize: Style.font.bodySmall
             }
@@ -1294,16 +1334,19 @@ Item {
             Text {
               width: errorList.width - Style.space(30)
               textFormat: Text.PlainText
-              text: (modelData.line > 0 ? ("L" + modelData.line + ":" + modelData.col + " — ") : "") + modelData.message
-              color: root.foreground
+              text: (modelData.line > 0 ? ("L" + modelData.line + ":" + modelData.col + " — ") : "")
+                + modelData.message
+                + (modelData.count > 1 ? (" (×" + modelData.count + ")") : "")
+              color: modelData.isMore ? root.accentColor : root.foreground
               font.family: root.uiFont
               font.pixelSize: Style.font.bodySmall
+              font.italic: !!modelData.isMore
               wrapMode: Text.Wrap
 
               MouseArea {
                 anchors.fill: parent
-                cursorShape: modelData.line > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor
-                onClicked: root.jumpToError(modelData)
+                cursorShape: (modelData.isMore || modelData.line > 0) ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: modelData.isMore ? root.showErrorLogRequested() : root.jumpToError(modelData)
               }
             }
           }
