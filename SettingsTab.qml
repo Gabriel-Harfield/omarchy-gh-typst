@@ -18,10 +18,12 @@ Item {
   required property color accentColor
   required property string uiFont
   required property string journalDir
+  required property string commandsSyncDir
 
   signal autosaveEnabledSet(bool enabled)
   signal autosaveMinutesSet(int minutes)
   signal journalDirSet(string dir)
+  signal commandsSyncDirSet(string dir)
 
   // journalDirField.text can't just be `text: root.journalDir` — the same
   // established trap as pathBarField/notesField elsewhere in this
@@ -33,6 +35,11 @@ Item {
   onJournalDirChanged: {
     if (!journalDirField || journalDirField.text === root.journalDir) return
     journalDirField.text = root.journalDir
+  }
+
+  onCommandsSyncDirChanged: {
+    if (!commandsSyncDirField || commandsSyncDirField.text === root.commandsSyncDir) return
+    commandsSyncDirField.text = root.commandsSyncDir
   }
 
   // --- Typst Universe template picker -------------------------------------
@@ -268,6 +275,48 @@ Item {
         foreground: root.foreground
         accent: root.accentColor
         onClicked: root.journalDirSet(journalDirField.text.trim())
+      }
+    }
+
+    PanelSeparator { foreground: root.foreground; width: parent.width }
+
+    Text {
+      text: "Commandes"
+      color: root.foreground
+      font.family: root.uiFont
+      font.pixelSize: Style.font.heading
+      font.bold: true
+    }
+
+    Text {
+      width: Math.min(parent.width, Style.space(520))
+      textFormat: Text.PlainText
+      text: "Dossier partagé (Dropbox ou équivalent) pour synchroniser la banque de commandes de l'onglet Commandes entre plusieurs ordinateurs. La fusion est additive et automatique (à l'ouverture de GH Typst et à chaque commande ajoutée) : rien n'est jamais écrasé. Supprimer une commande ici ne la supprime pas automatiquement de l'autre machine — à faire des deux côtés si besoin. Laissez vide pour désactiver la synchronisation."
+      color: root.dim
+      font.family: root.uiFont
+      font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.Wrap
+    }
+
+    Row {
+      spacing: Style.space(8)
+
+      TextField {
+        id: commandsSyncDirField
+        anchors.verticalCenter: parent.verticalCenter
+        width: Math.min(Style.space(460), settingsScroll.availableWidth - Style.space(180))
+        placeholderText: "/chemin/vers/le/dossier/synchronisé"
+        Component.onCompleted: text = root.commandsSyncDir
+        onAccepted: root.commandsSyncDirSet(text.trim())
+      }
+
+      Button {
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Utiliser ce dossier"
+        bordered: true
+        foreground: root.foreground
+        accent: root.accentColor
+        onClicked: root.commandsSyncDirSet(commandsSyncDirField.text.trim())
       }
     }
   }

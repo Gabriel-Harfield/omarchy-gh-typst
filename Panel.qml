@@ -9,6 +9,7 @@ import "lib/CodeReview.js" as CodeReview
 import "lib/Spellcheck.js" as Spellcheck
 import "lib/Outline.js" as Outline
 import "lib/Calendar.js" as Calendar
+import "lib/Files.js" as Files
 
 // GH Typst: a personal Typst editor. Highlighting + live preview + real
 // compiler diagnostics live in EditorTab.qml; the Claude-powered review
@@ -33,6 +34,12 @@ Item {
   function open(payloadJson) {
     root.closingFromHost = false
     window.visible = true
+    // Catches command-bank changes made on another machine since the last
+    // sync — settings.json (and so commandsSyncDir) only loads once at
+    // startup (keepLoaded: true keeps this Item alive across summons), so
+    // without this a sync would otherwise only ever run once per shell
+    // restart instead of once per summon, same as GH Grilles' own open().
+    if (root.commandsSyncDir) root.runCommandsSync()
   }
 
   // Unconditional hide — used internally once any unsaved-changes check
@@ -146,6 +153,8 @@ Item {
   // hit once already (see this file's own history).
   readonly property string spellcheckWordsPath: stateDir + "/.ghtypst-spellcheck-words.txt"
   readonly property string spellcheckSuggestPath: stateDir + "/.ghtypst-spellcheck-suggest.txt"
+  readonly property string commandsPath: stateDir + "/commands.json"
+  readonly property string commandsTombstonesPath: stateDir + "/commands-sync-tombstones.json"
 
   // --- theme tokens (same set OmaSlide uses) --------------------------------
 
@@ -1976,6 +1985,7 @@ Item {
   property string journalDir: ""
   property string claudeModel: "" // "" | "sonnet" | "opus" | "haiku" | "fable" — "" = claude -p's own default
   property string claudeEffort: "" // "" | "low" | "medium" | "high" | "xhigh" | "max"
+  property string commandsSyncDir: "" // "" = sync disabled, same convention as GH Grilles' syncDir
 
   FileView {
     id: settingsFile
@@ -1999,7 +2009,9 @@ Item {
     root.journalDir = parsed.journalDir
     root.claudeModel = parsed.claudeModel
     root.claudeEffort = parsed.claudeEffort
+    root.commandsSyncDir = parsed.commandsSyncDir
     root.settingsLoaded = true
+    if (root.commandsSyncDir) root.runCommandsSync()
   }
 
   Timer {
@@ -2016,7 +2028,8 @@ Item {
       rightPaneHidden: root.rightPaneHidden,
       journalDir: root.journalDir,
       claudeModel: root.claudeModel,
-      claudeEffort: root.claudeEffort
+      claudeEffort: root.claudeEffort,
+      commandsSyncDir: root.commandsSyncDir
     }))
   }
 
@@ -2076,6 +2089,167 @@ Item {
   function setClaudeEffort(effort) {
     root.claudeEffort = effort
     root.scheduleSettingsSave()
+  }
+
+  // Turns a leading "~" into $HOME — argv-form Process commands never go
+  // through a shell, so a literal "~" typed into the sync-folder field
+  // would otherwise be looked up as a real directory named "~" instead of
+  // being expanded (same fix GH Grilles' own setSyncDir needed).
+  function expandHome(path) {
+    var p = String(path || "").trim()
+    if (p === "~") return root.homeDir
+    if (p.indexOf("~/") === 0) return root.homeDir + p.slice(1)
+    return p
+  }
+
+  function setCommandsSyncDir(dir) {
+    var clean = root.expandHome(dir).slice(0, 1024)
+    if (clean === root.commandsSyncDir) return
+    root.commandsSyncDir = clean
+    root.scheduleSettingsSave()
+    if (root.commandsSyncDir) root.runCommandsSync()
+  }
+
+  // --- commands bank ("Commandes" tab, Gabriel's ask 2026-09-05) ---------
+  //
+  // A personal library of frequently-reused Typst snippets, global (not
+  // per-document, same reasoning as journalDir above). "Copier" (wl-copy)
+  // only — deliberately NOT inserted at the cursor, Gabriel's explicit
+  // choice: he pastes it himself. Sync is GH Grilles' additive-merge
+  // design, copied rather than shared since these are separate plugin
+  // repos: nothing is ever silently overwritten, and deleting an entry
+  // here doesn't remove it from another machine until deleted there too.
+
+  property var commandBank: []
+
+  FileView {
+    id: commandsFile
+    path: root.commandsPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.commandBank = Store.parseCommandBank(commandsFile.text())
+    onLoadFailed: root.commandBank = []
+  }
+
+  function persistCommandBank() {
+    commandsFile.setText(Store.serializeCommandBank(root.commandBank))
+  }
+
+  property var commandDeletedKeys: []
+
+  FileView {
+    id: commandsTombstonesFile
+    path: root.commandsTombstonesPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.commandDeletedKeys = Store.parseCommandTombstones(commandsTombstonesFile.text())
+    onLoadFailed: root.commandDeletedKeys = []
+  }
+
+  function persistCommandTombstones() {
+    commandsTombstonesFile.setText(Store.serializeCommandTombstones(root.commandDeletedKeys))
+  }
+
+  function addCommandEntry(title, command) {
+    root.commandBank = Store.addCommandEntry(root.commandBank, title, command)
+    root.persistCommandBank()
+    if (root.commandsSyncDir) root.runCommandsSync()
+  }
+
+  function deleteCommandEntry(id) {
+    var target = null
+    for (var i = 0; i < root.commandBank.length; i++) {
+      if (root.commandBank[i].id === id) { target = root.commandBank[i]; break }
+    }
+    root.commandBank = Store.removeCommandEntry(root.commandBank, id)
+    root.persistCommandBank()
+    if (target) {
+      root.commandDeletedKeys = Store.sanitizeCommandTombstones(
+        root.commandDeletedKeys.concat([Store.commandKey(target.title, target.command)]))
+      root.persistCommandTombstones()
+    }
+    if (root.commandsSyncDir) root.runCommandsSync()
+  }
+
+  function copyCommand(text) {
+    commandCopyProc.command = ["wl-copy", text]
+    commandCopyProc.running = false
+    commandCopyProc.running = true
+    root.commandCopyFeedback = "Copié !"
+    commandCopyFeedbackTimer.restart()
+  }
+
+  Process { id: commandCopyProc }
+
+  property string commandCopyFeedback: ""
+
+  Timer {
+    id: commandCopyFeedbackTimer
+    interval: 1500
+    repeat: false
+    onTriggered: root.commandCopyFeedback = ""
+  }
+
+  // Sync: mirrors GH Grilles' runSync()/ensureSyncDirProc/syncReadProc
+  // chain exactly, just against commands.json instead of criteria.json —
+  // see that plugin's Panel.qml for the fuller rationale on each step.
+  property bool commandsSyncInFlight: false
+  property string _commandsSyncPendingDir: ""
+
+  function runCommandsSync() {
+    if (!root.commandsSyncDir || root.commandsSyncInFlight) return
+    root.commandsSyncInFlight = true
+    commandsSyncInFlightTimeout.restart()
+    root._commandsSyncPendingDir = root.commandsSyncDir
+    ensureCommandsSyncDirProc.command = ["mkdir", "-p", "--", root._commandsSyncPendingDir]
+    ensureCommandsSyncDirProc.running = false
+    ensureCommandsSyncDirProc.running = true
+  }
+
+  // Quickshell's FileView exposes no onSaveFailed signal, so a write to an
+  // unreachable sync folder has no failure event to catch — this timer is
+  // the fallback that still clears commandsSyncInFlight in that case, so
+  // one bad sync folder can never permanently wedge every later attempt.
+  Timer {
+    id: commandsSyncInFlightTimeout
+    interval: 8000
+    repeat: false
+    onTriggered: root.commandsSyncInFlight = false
+  }
+
+  Process {
+    id: ensureCommandsSyncDirProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { commandsSyncInFlightTimeout.stop(); root.commandsSyncInFlight = false; return }
+      var cmd = Files.readCommand(root._commandsSyncPendingDir, "commands.json", 4194304, 5)
+      if (!cmd) { commandsSyncInFlightTimeout.stop(); root.commandsSyncInFlight = false; return }
+      commandsSyncReadProc.command = cmd
+      commandsSyncReadProc.running = false
+      commandsSyncReadProc.running = true
+    }
+  }
+
+  Process {
+    id: commandsSyncReadProc
+    stdout: StdioCollector { id: commandsSyncReadOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var remoteBank = Store.parseCommandBank(commandsSyncReadOut.text || "[]")
+      var merged = Store.mergeCommandBanks(root.commandBank, remoteBank, root.commandDeletedKeys)
+      root.commandBank = merged
+      root.persistCommandBank()
+      commandsSyncWriteFile.path = root._commandsSyncPendingDir + "/commands.json"
+      Qt.callLater(function() { commandsSyncWriteFile.setText(Store.serializeCommandBank(merged)) })
+    }
+  }
+
+  FileView {
+    id: commandsSyncWriteFile
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onSaved: { commandsSyncInFlightTimeout.stop(); root.commandsSyncInFlight = false }
   }
 
   // Only writes to disk when there's actually a path — an untitled
@@ -2499,8 +2673,8 @@ Item {
                 iconText: root.rightPaneHidden ? "" : ""
                 selected: root.rightPaneHidden
                 tooltipText: root.rightPaneHidden
-                  ? "Réafficher le panneau Aperçu/Notes"
-                  : "Masquer le panneau Aperçu/Notes (l'éditeur prend toute la largeur)"
+                  ? "Réafficher le panneau Aperçu/Notes/Journal/Commandes"
+                  : "Masquer le panneau Aperçu/Notes/Journal/Commandes (l'éditeur prend toute la largeur)"
                 foreground: root.fg
                 accent: root.accentColor
                 onClicked: root.setRightPaneHidden(!root.rightPaneHidden)
@@ -2542,6 +2716,13 @@ Item {
                   foreground: root.fg
                   accent: root.accentColor
                   onClicked: root.rightPaneView = "journal"
+                }
+                Button {
+                  text: "Commandes"
+                  selected: root.rightPaneView === "commandes"
+                  foreground: root.fg
+                  accent: root.accentColor
+                  onClicked: root.rightPaneView = "commandes"
                 }
                 Text {
                   visible: root.compiling
@@ -3100,6 +3281,8 @@ Item {
               journalSelectedDay: root.journalSelectedDay
               journalText: root.journalText
               journalEntryDays: root.journalEntryDays
+              commandBank: root.commandBank
+              commandCopyFeedback: root.commandCopyFeedback
               onTextEdited: function(newText) { root.onTextEdited(newText) }
               onZoomInRequested: root.setEditorZoom(root.editorZoom + 0.1)
               onZoomOutRequested: root.setEditorZoom(root.editorZoom - 0.1)
@@ -3110,6 +3293,9 @@ Item {
               onApplySuggestionRequested: function(start, end, replacement) { root.applySuggestion(start, end, replacement) }
               onNotesEdited: function(newText) { root.onNotesEdited(newText) }
               onShowErrorLogRequested: root.errorLogWindowVisible = true
+              onCommandCopyRequested: function(command) { root.copyCommand(command) }
+              onCommandAddRequested: function(title, command) { root.addCommandEntry(title, command) }
+              onCommandDeleteRequested: function(id) { root.deleteCommandEntry(id) }
               onJournalPrevMonthRequested: root.journalPrevMonth()
               onJournalNextMonthRequested: root.journalNextMonth()
               onJournalDaySelected: function(day) { root.journalSelectDay(day) }
@@ -3166,12 +3352,14 @@ Item {
             accentColor: root.accentColor
             uiFont: root.uiFont
             journalDir: root.journalDir
+            commandsSyncDir: root.commandsSyncDir
             onAutosaveEnabledSet: function(enabled) { root.setAutosaveEnabled(enabled) }
             onAutosaveMinutesSet: function(minutes) { root.setAutosaveMinutes(minutes) }
             onTypstUniverseOpenRequested: root.openWebapp(root.typstUniverseUrl)
             onTemplateLinkOpenRequested: function(url) { root.openWebapp(url) }
             onTemplateInsertRequested: function(command) { root.insertTemplate(command) }
             onJournalDirSet: function(dir) { root.setJournalDir(dir) }
+            onCommandsSyncDirSet: function(dir) { root.setCommandsSyncDir(dir) }
           }
         }
 

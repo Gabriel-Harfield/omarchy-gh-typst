@@ -83,6 +83,12 @@ Item {
   required property int journalSelectedDay
   required property string journalText
   required property var journalEntryDays
+  // Commandes (Gabriel's ask, 2026-09-05) — a personal library of
+  // frequently-reused Typst snippets, GLOBAL like journalDir above (not
+  // per-document). [{ id, title, command }]; Panel.qml owns the actual
+  // bank + sync, this is read-only from here.
+  required property var commandBank
+  required property string commandCopyFeedback
 
   signal textEdited(string newText)
   signal zoomInRequested()
@@ -98,6 +104,9 @@ Item {
   signal applySuggestionRequested(int start, int end, string replacement)
   signal notesEdited(string newText)
   signal showErrorLogRequested()
+  signal commandCopyRequested(string command)
+  signal commandAddRequested(string title, string command)
+  signal commandDeleteRequested(string id)
 
   // See notesField's own comment (below, in the right-pane Notes view)
   // for why this guard exists — imperative resync instead of a plain
@@ -119,6 +128,14 @@ Item {
     journalField.text = root.journalText
     root._journalProgrammatic = false
   }
+
+  // Commandes: local UI-only state for the "Ajouter une commande" overlay
+  // and the delete-confirmation dialog — the bank itself lives in
+  // Panel.qml (commandBank prop above), reached only via the three
+  // commandXRequested signals.
+  property bool addCommandOpen: false
+  property string _pendingDeleteCommandId: ""
+  property string _pendingDeleteCommandTitle: ""
 
   // Pure month-grid layout, computed locally (Calendar.js has no QML/file
   // dependencies of its own, same "isolated component" spirit as this
@@ -1667,6 +1684,242 @@ Item {
           }
         }
       }
+
+      // Commandes (Gabriel's ask, 2026-09-05) — a personal library of
+      // frequently-reused Typst snippets. "Copier" is wl-copy only
+      // (Panel.qml's copyCommand()), deliberately not an insert at the
+      // cursor — Gabriel pastes it himself. Same Rectangle shape as the
+      // three sibling views above.
+      Rectangle {
+        width: parent.width
+        height: parent.height - Style.space(30)
+        color: Qt.darker(root.background, 1.05)
+        border.color: root.faint
+        border.width: 1
+        radius: Style.cornerRadius
+        clip: true
+        visible: root.rightPaneView === "commandes"
+
+        Item {
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+
+          Row {
+            id: commandsHeaderRow
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: Style.space(10)
+
+            Button {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "+ Ajouter une commande"
+              bordered: true
+              foreground: root.foreground
+              accent: root.accentColor
+              onClicked: root.addCommandOpen = true
+            }
+
+            Text {
+              visible: root.commandCopyFeedback !== ""
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.commandCopyFeedback
+              color: root.accentColor
+              font.family: root.uiFont
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+          }
+
+          Text {
+            visible: root.commandBank.length === 0
+            anchors.top: commandsHeaderRow.bottom
+            anchors.topMargin: Style.space(10)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            wrapMode: Text.Wrap
+            text: "Aucune commande enregistrée pour l'instant. Ajoutez ici vos commandes Typst les plus utilisées pour les copier en un clic."
+            color: root.faint
+            font.family: root.uiFont
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          ScrollView {
+            id: commandsScroll
+            anchors.top: commandsHeaderRow.bottom
+            anchors.topMargin: Style.space(10)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            clip: true
+            visible: root.commandBank.length > 0
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            Column {
+              width: commandsScroll.availableWidth
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.commandBank
+
+                delegate: Rectangle {
+                  id: commandCard
+                  required property var modelData
+                  width: parent.width
+                  height: Math.max(commandTitle.implicitHeight, copyCommandButton.implicitHeight, deleteCommandButton.implicitHeight) + Style.space(12)
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05)
+                  border.color: root.faint
+                  border.width: 1
+                  radius: Style.cornerRadius
+
+                  Text {
+                    id: commandTitle
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(10)
+                    anchors.right: copyCommandButton.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    text: commandCard.modelData.title
+                    color: root.foreground
+                    font.family: root.uiFont
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Button {
+                    id: copyCommandButton
+                    anchors.right: deleteCommandButton.left
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Copier"
+                    bordered: true
+                    foreground: root.foreground
+                    accent: root.accentColor
+                    onClicked: root.commandCopyRequested(commandCard.modelData.command)
+                  }
+
+                  Button {
+                    id: deleteCommandButton
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "✕"
+                    tooltipText: "Supprimer cette commande"
+                    foreground: root.foreground
+                    accent: root.urgentColor
+                    onClicked: {
+                      root._pendingDeleteCommandId = commandCard.modelData.id
+                      root._pendingDeleteCommandTitle = commandCard.modelData.title
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------- "Ajouter une commande"
+  // Full-tab overlay (not scoped to the narrow right pane) so the dialog
+  // reads properly centered — same manual scrim+card shape as qs.Ui's own
+  // ConfirmDialog, just with two input fields instead of a message.
+  Rectangle {
+    id: addCommandOverlay
+    anchors.fill: parent
+    visible: root.addCommandOpen
+    color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.7)
+
+    MouseArea { anchors.fill: parent; onClicked: root.addCommandOpen = false }
+
+    Rectangle {
+      width: Math.min(parent.width - Style.space(32), Style.space(480))
+      height: addCommandContent.implicitHeight + Style.space(36)
+      anchors.centerIn: parent
+      color: root.background
+      border.color: root.accentColor
+      border.width: 1
+      radius: Style.cornerRadius
+
+      MouseArea { anchors.fill: parent; onClicked: {} }
+
+      Column {
+        id: addCommandContent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: Style.space(18)
+        spacing: Style.space(10)
+
+        Text {
+          text: "Ajouter une commande"
+          color: root.foreground
+          font.family: root.uiFont
+          font.pixelSize: Style.font.heading
+          font.bold: true
+        }
+
+        TextField {
+          id: addCommandTitleField
+          width: parent.width
+          placeholderText: "Titre (ex. Insérer une image)"
+          Keys.onEscapePressed: root.addCommandOpen = false
+        }
+
+        TextArea {
+          id: addCommandTextField
+          width: parent.width
+          height: Style.space(120)
+          placeholderText: "Commande Typst (ex. #figure(image(\"monimage.png\", width: 80%)))"
+          wrapMode: TextEdit.Wrap
+          font.family: root.monoFont
+          font.pixelSize: root.editorFontSize
+          Keys.onEscapePressed: root.addCommandOpen = false
+        }
+
+        Row {
+          spacing: Style.space(10)
+
+          Button {
+            text: "Ajouter"
+            bordered: true
+            foreground: root.foreground
+            accent: root.accentColor
+            enabled: addCommandTitleField.text.trim() !== "" && addCommandTextField.text.trim() !== ""
+            onClicked: {
+              root.commandAddRequested(addCommandTitleField.text.trim(), addCommandTextField.text.trim())
+              addCommandTitleField.text = ""
+              addCommandTextField.text = ""
+              root.addCommandOpen = false
+            }
+          }
+          Button {
+            text: "Annuler"
+            bordered: true
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: root.addCommandOpen = false
+          }
+        }
+      }
+    }
+  }
+
+  ConfirmDialog {
+    anchors.fill: parent
+    opened: root._pendingDeleteCommandId !== ""
+    message: "Supprimer « " + root._pendingDeleteCommandTitle + " » de la banque de commandes ?"
+    cancelText: "Annuler"
+    confirmText: "Supprimer"
+    selectedIndex: 0
+    background: root.background
+    foreground: root.foreground
+    onCanceled: root._pendingDeleteCommandId = ""
+    onConfirmed: {
+      root.commandDeleteRequested(root._pendingDeleteCommandId)
+      root._pendingDeleteCommandId = ""
     }
   }
 }
